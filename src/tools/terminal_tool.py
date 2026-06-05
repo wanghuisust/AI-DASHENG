@@ -1,0 +1,42 @@
+"""终端命令执行工具"""
+
+from langchain_core.tools import tool
+
+
+@tool
+def terminal_execute(command: str, timeout: int = 30) -> str:
+    """在本地终端执行 shell 命令并返回输出。
+
+    Args:
+        command: 要执行的 shell 命令
+        timeout: 超时秒数，默认30
+
+    Returns:
+        命令的标准输出和标准错误
+    """
+    import subprocess
+    import platform
+
+    try:
+        is_windows = platform.system() == "Windows"
+        result = subprocess.run(
+            command if is_windows else ["/bin/bash", "-c", command],
+            shell=is_windows,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            output += f"\n[stderr] {result.stderr}"
+        if result.returncode != 0:
+            output += f"\n[exit code: {result.returncode}]"
+        return output.strip() or "(无输出)"
+    except subprocess.TimeoutExpired:
+        return f"[错误] 命令超时（{timeout}秒）"
+    except Exception as e:
+        return f"[错误] 执行失败: {e}"
