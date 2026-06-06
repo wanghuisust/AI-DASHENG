@@ -7,3 +7,8 @@ logs/
 *.egg-info/
 dist/
 build/
+*.log
+*.db
+src/llama.cpp/
+src/$null
+src/data/
