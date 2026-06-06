@@ -444,7 +444,30 @@ def setup():
     )
     env["MODEL_NAME"] = model
 
-    echo_ok(f"LLM 配置: {model} @ {base_url}")
+    # 上下文长度：自定义模型必须设置，内置模型有默认值
+    context_defaults = {
+        "1": 128000,   # OpenAI gpt-4o-mini
+        "2": 131072,   # Qwen qwen-plus
+        "3": 65536,    # DeepSeek
+        "4": 128000,   # GLM-4
+        "5": 8192,     # Moonshot v1-8k
+        "6": 32768,    # SiliconFlow
+        "7": 128000,   # Agnes
+    }
+    current_ctx = env.get("MODEL_CONTEXT_LENGTH", "")
+    if choice == "8":
+        # 自定义：必须输入
+        ctx_len = click.prompt(
+            "请输入模型上下文长度（token 数）",
+            type=int, default=int(current_ctx) if current_ctx else 32768
+        )
+    else:
+        ctx_len = context_defaults.get(choice, 32768)
+        if current_ctx:
+            ctx_len = int(current_ctx)
+    env["MODEL_CONTEXT_LENGTH"] = str(ctx_len)
+
+    echo_ok(f"LLM 配置: {model} @ {base_url} (上下文: {ctx_len} tokens, 压缩阈值: {ctx_len // 2})")
 
     # ── 2. QQ Bot 配置 ───────────────────────────────────────────────────
     click.echo("")
@@ -917,9 +940,12 @@ def status():
     base_url = env.get("OPENAI_BASE_URL", "未设置")
     api_key = env.get("OPENAI_API_KEY", "")
     key_display = f"{api_key[:8]}..." if len(api_key) > 8 else ("已设置" if api_key else "未设置")
+    ctx_len = env.get("MODEL_CONTEXT_LENGTH", "50000")
+    compress_threshold = int(ctx_len) // 2
     click.echo(f"  LLM:      {model}")
     click.echo(f"  Base URL: {base_url}")
     click.echo(f"  API Key:  {key_display}")
+    click.echo(f"  上下文:   {ctx_len} tokens (压缩阈值: {compress_threshold})")
 
     # QQ
     qq_id = env.get("QQ_APP_ID", "")

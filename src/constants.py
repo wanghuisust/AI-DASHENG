@@ -1,7 +1,15 @@
 """共享常量和工具函数，避免循环导入"""
 
-# 最大上下文 token 数（llama.cpp n_ctx=64000，留 14k 给回复）
-MAX_CONTEXT_TOKENS = 50000
+import os
+
+# 从 .env 读取模型上下文长度（token 数），默认 50000
+MODEL_CONTEXT_LENGTH = int(os.environ.get("MODEL_CONTEXT_LENGTH", "50000"))
+
+# 最大上下文 token 数（用于 trim 和压缩判断）
+MAX_CONTEXT_TOKENS = MODEL_CONTEXT_LENGTH
+
+# 上下文压缩阈值：达到上下文长度的 50% 时自动压缩
+COMPRESS_THRESHOLD = int(MODEL_CONTEXT_LENGTH * 0.5)
 
 
 def estimate_tokens(text: str) -> int:
@@ -29,7 +37,7 @@ def trim_messages_to_tokens(msgs: list, max_tokens: int = MAX_CONTEXT_TOKENS) ->
         if hasattr(msg, 'name') and msg.name == 'tool':
             content = str(content) * 2  # 工具输出双倍估算
 
-        msg_tokens = estimate_tokens(content) + 10  # 消息格式开销
+        msg_tokens = estimate_tokens(content) + 10
         if total + msg_tokens > max_tokens:
             break
         total += msg_tokens

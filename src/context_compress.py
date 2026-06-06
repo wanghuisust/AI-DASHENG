@@ -6,9 +6,8 @@
 """
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from constants import estimate_tokens, MAX_CONTEXT_TOKENS
+from constants import estimate_tokens, COMPRESS_THRESHOLD
 
-COMPRESS_THRESHOLD = int(MAX_CONTEXT_TOKENS * 0.7)  # 35000
 KEEP_RECENT = 6
 
 

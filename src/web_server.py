@@ -175,7 +175,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 try:
                     invoke_result[0] = graph.invoke(
                         {"messages": messages},
-                        config={"recursion_limit": 8}
+                        config={"recursion_limit": 128}
                     )
                 except Exception as e:
                     invoke_error[0] = e
@@ -257,7 +257,7 @@ class ChatHandler(BaseHTTPRequestHandler):
 
             for event in graph.stream(
                 {"messages": messages},
-                config={"recursion_limit": 8}
+                config={"recursion_limit": 128}
             ):
                 # event 是 {node_name: output_dict}
                 for node_name, node_output in event.items():
