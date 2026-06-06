@@ -54,8 +54,10 @@ def create_llm(model: str = None, base_url: str = None, api_key: str = None):
         base_url=base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         api_key=api_key or os.getenv("OPENAI_API_KEY"),
         temperature=0.3,
-        # 单次 LLM 调用超时 30 秒（Agnes 免费版较慢）
-        request_timeout=30,
+        # 单次 LLM 调用超时 60 秒（Agnes 免费版较慢）
+        request_timeout=60,
+        # 遇到 429 rate limit 自动重试，最多 5 次，指数退避
+        max_retries=5,
     )
     if os.getenv("ENABLE_TOOLS", "true").lower() == "true":
         return llm.bind_tools(ALL_TOOLS)

@@ -1,7 +1,12 @@
 Set ws = CreateObject("WScript.Shell")
 
-' WebServer (7860)
+' Agent API (8900)
 ws.Environment("Process").Item("ENABLE_TOOLS") = "true"
+ws.Run "G:\AI-DASHENG\.venv\Scripts\pythonw.exe G:\AI-DASHENG\src\agent_api.py", 0, False
+
+WScript.Sleep 3000
+
+' WebServer (7860)
 ws.Run "G:\AI-DASHENG\.venv\Scripts\pythonw.exe G:\AI-DASHENG\src\web_server.py", 0, False
 
 ' Gateway (9090)

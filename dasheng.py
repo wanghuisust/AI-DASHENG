@@ -68,10 +68,12 @@ def get_gateway_python_plain() -> Path:
     return Path("python.exe")
 
 # 服务入口
+AGENT_API_ENTRY = SRC_DIR / "agent_api.py"
 WEB_SERVER_ENTRY = SRC_DIR / "web_server.py"
 GATEWAY_ENTRY = SRC_DIR / "gateway" / "server.py"
 
 # 服务端口
+AGENT_API_PORT = 8900
 WEB_SERVER_PORT = 7860
 GATEWAY_PORT = 9090
 
@@ -212,7 +214,7 @@ def find_python_processes() -> list:
 
 
 def generate_vbs(env: dict = None) -> str:
-    """生成 VBS 启动脚本"""
+    """生成 VBS 启动脚本（三进程：Agent API + WebServer + Gateway）"""
     if env is None:
         env = load_env()
 
@@ -224,11 +226,25 @@ def generate_vbs(env: dict = None) -> str:
     vbs_lines = [
         'Set ws = CreateObject("WScript.Shell")',
         '',
-        f"\' WebServer ({WEB_SERVER_PORT})",
+        f"\' Agent API ({AGENT_API_PORT})",
         f'ws.Environment("Process").Item("ENABLE_TOOLS") = "{enable_tools}"',
     ]
 
-    # WebServer 用 .venv pythonw
+    # Agent API 用 .venv pythonw（必须先启动，Gateway/WebServer 依赖它）
+    if VENV_PYTHONW.exists():
+        vbs_lines.append(
+            f'ws.Run "{VENV_PYTHONW} {AGENT_API_ENTRY}", 0, False'
+        )
+    else:
+        vbs_lines.append(
+            f'ws.Run "pythonw.exe {AGENT_API_ENTRY}", 0, False'
+        )
+
+    # 等待 Agent API 就绪
+    vbs_lines.append('WScript.Sleep 3000')
+    vbs_lines.append('')
+
+    vbs_lines.append(f"\' WebServer ({WEB_SERVER_PORT})")
     if VENV_PYTHONW.exists():
         vbs_lines.append(
             f'ws.Run "{VENV_PYTHONW} {WEB_SERVER_ENTRY}", 0, False'
@@ -573,7 +589,8 @@ def setup():
 @cli.command()
 @click.option("--web-only", is_flag=True, help="仅启动 WebServer")
 @click.option("--gateway-only", is_flag=True, help="仅启动 Gateway")
-def start(web_only, gateway_only):
+@click.option("--agent-only", is_flag=True, help="仅启动 Agent API")
+def start(web_only, gateway_only, agent_only):
     """启动 DASHENG 服务"""
 
     echo_info("启动 DASHENG 服务...")
@@ -586,15 +603,17 @@ def start(web_only, gateway_only):
         env = load_env()
 
     # 检查 venv
-    if not web_only and not gateway_only:
+    if not web_only and not gateway_only and not agent_only:
         if not is_venv_ready():
             echo_error(".venv 未就绪，请先运行 install")
             sys.exit(1)
 
     # 检查端口占用
-    if not gateway_only and check_port(WEB_SERVER_PORT):
+    if not gateway_only and not web_only and check_port(AGENT_API_PORT):
+        echo_warn(f"端口 {AGENT_API_PORT} 已被占用，Agent API 可能已在运行")
+    if not gateway_only and not agent_only and check_port(WEB_SERVER_PORT):
         echo_warn(f"端口 {WEB_SERVER_PORT} 已被占用，WebServer 可能已在运行")
-    if not web_only and check_port(int(env.get("GATEWAY_PORT", GATEWAY_PORT))):
+    if not web_only and not agent_only and check_port(int(env.get("GATEWAY_PORT", GATEWAY_PORT))):
         echo_warn(f"端口 {env.get('GATEWAY_PORT', GATEWAY_PORT)} 已被占用，Gateway 可能已在运行")
 
     # 生成 VBS
@@ -602,97 +621,72 @@ def start(web_only, gateway_only):
     with open(VBS_FILE, "w", encoding="utf-8") as f:
         f.write(vbs_content)
 
-    if web_only:
-        # 仅启动 WebServer
-        echo_info("仅启动 WebServer...")
-        if VENV_PYTHONW.exists():
-            cmd = f'"{VENV_PYTHONW}" "{WEB_SERVER_ENTRY}"'
-        else:
-            cmd = f'pythonw.exe "{WEB_SERVER_ENTRY}"'
-
-        # 设置环境变量
-        os.environ["ENABLE_TOOLS"] = env.get("ENABLE_TOOLS", "true")
-
+    def _start_process(name, entry, pythonw_path=None):
+        """启动单个进程"""
+        if pythonw_path is None:
+            pythonw_path = VENV_PYTHONW if VENV_PYTHONW.exists() else Path("pythonw.exe")
+        cmd = f'"{pythonw_path}" "{entry}"'
         try:
-            subprocess.Popen(
-                cmd, shell=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            echo_ok(f"WebServer 已启动 (端口 {WEB_SERVER_PORT})")
+            subprocess.Popen(cmd, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            echo_ok(f"{name} 启动命令已发送")
         except Exception as e:
-            echo_error(f"启动 WebServer 失败: {e}")
-            sys.exit(1)
+            echo_error(f"启动 {name} 失败: {e}")
+
+    if agent_only:
+        echo_info("仅启动 Agent API...")
+        os.environ["ENABLE_TOOLS"] = env.get("ENABLE_TOOLS", "true")
+        _start_process("Agent API", AGENT_API_ENTRY)
+
+    elif web_only:
+        echo_info("仅启动 WebServer...")
+        _start_process("WebServer", WEB_SERVER_ENTRY)
 
     elif gateway_only:
-        # 仅启动 Gateway
         echo_info("仅启动 Gateway...")
         gw_pythonw = get_gateway_python()
-        cmd = f'"{gw_pythonw}" "{GATEWAY_ENTRY}"'
-
-        # 设置环境变量
         for key in ["GATEWAY_PORT", "QQ_APP_ID", "QQ_APP_SECRET", "QQ_IS_SANDBOX",
                      "WECHAT_ENABLED", "ILINK_BOT_TOKEN", "ILINK_ACCOUNT_ID"]:
             if key in env:
                 os.environ[key] = env[key]
-
-        try:
-            subprocess.Popen(
-                cmd, shell=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            echo_ok(f"Gateway 已启动 (端口 {env.get('GATEWAY_PORT', GATEWAY_PORT)})")
-        except Exception as e:
-            echo_error(f"启动 Gateway 失败: {e}")
-            sys.exit(1)
+        _start_process("Gateway", GATEWAY_ENTRY, gw_pythonw)
 
     else:
         # 启动全部 — 使用 VBS
-        echo_info("通过 VBS 启动全部服务...")
+        echo_info("通过 VBS 启动全部服务（Agent API + WebServer + Gateway）...")
 
-        # 方式1: 直接用 VBS（双击效果，完全隐藏窗口）
         try:
-            subprocess.Popen(
-                f'wscript.exe "{VBS_FILE}"',
-                shell=True
-            )
+            subprocess.Popen(f'wscript.exe "{VBS_FILE}"', shell=True)
             echo_ok("VBS 启动脚本已执行")
         except Exception as e:
             echo_warn(f"VBS 启动失败: {e}，尝试直接启动...")
-
-            # 方式2: 直接用 pythonw 启动
-            # WebServer
-            if VENV_PYTHONW.exists():
-                web_cmd = [str(VENV_PYTHONW), str(WEB_SERVER_ENTRY)]
-            else:
-                web_cmd = ["pythonw.exe", str(WEB_SERVER_ENTRY)]
-
+            # Agent API（先启动）
             os.environ["ENABLE_TOOLS"] = env.get("ENABLE_TOOLS", "true")
-            try:
-                subprocess.Popen(web_cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-                echo_ok(f"WebServer 已启动 (端口 {WEB_SERVER_PORT})")
-            except Exception as e2:
-                echo_error(f"启动 WebServer 失败: {e2}")
-
+            _start_process("Agent API", AGENT_API_ENTRY)
+            time.sleep(3)
+            # WebServer
+            _start_process("WebServer", WEB_SERVER_ENTRY)
             # Gateway
             gw_pythonw = get_gateway_python()
-            gw_cmd = [str(gw_pythonw), str(GATEWAY_ENTRY)]
-
             for key in ["GATEWAY_PORT", "QQ_APP_ID", "QQ_APP_SECRET", "QQ_IS_SANDBOX",
                          "WECHAT_ENABLED", "ILINK_BOT_TOKEN", "ILINK_ACCOUNT_ID"]:
                 if key in env:
                     os.environ[key] = env[key]
-
-            try:
-                subprocess.Popen(gw_cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-                echo_ok(f"Gateway 已启动 (端口 {env.get('GATEWAY_PORT', GATEWAY_PORT)})")
-            except Exception as e2:
-                echo_error(f"启动 Gateway 失败: {e2}")
+            _start_process("Gateway", GATEWAY_ENTRY, gw_pythonw)
 
     # 等待服务就绪
     click.echo("")
     echo_info("等待服务启动...")
 
-    if not gateway_only:
+    if not gateway_only and not web_only:
+        for i in range(20):
+            if check_port(AGENT_API_PORT):
+                echo_ok(f"Agent API 就绪 → http://127.0.0.1:{AGENT_API_PORT}")
+                break
+            time.sleep(1)
+        else:
+            echo_warn("Agent API 未在 20s 内就绪，请检查日志")
+
+    if not gateway_only and not agent_only:
         for i in range(15):
             if check_port(WEB_SERVER_PORT):
                 echo_ok(f"WebServer 就绪 → http://127.0.0.1:{WEB_SERVER_PORT}")
@@ -701,7 +695,7 @@ def start(web_only, gateway_only):
         else:
             echo_warn("WebServer 未在 15s 内就绪，请检查日志")
 
-    if not web_only:
+    if not web_only and not agent_only:
         gw_port = int(env.get("GATEWAY_PORT", GATEWAY_PORT))
         for i in range(15):
             if check_port(gw_port):
@@ -748,6 +742,26 @@ def stop(force):
 
     # 正常模式：按端口查找并终止
     stopped = False
+
+    # 检查 Agent API 端口
+    if check_port(AGENT_API_PORT):
+        echo_info(f"端口 {AGENT_API_PORT} 被占用，尝试停止 Agent API...")
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.split("\n"):
+                if f":{AGENT_API_PORT}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = parts[-1]
+                    if pid.isdigit():
+                        subprocess.run(["taskkill", "/PID", pid, "/F"],
+                                       capture_output=True, timeout=5)
+                        echo_ok(f"Agent API 已停止 (PID {pid})")
+                        stopped = True
+        except Exception as e:
+            echo_warn(f"自动停止失败: {e}")
 
     # 检查 WebServer 端口
     if check_port(WEB_SERVER_PORT):
@@ -809,12 +823,15 @@ def stop(force):
 
     # 验证
     time.sleep(1)
+    agent_ok = not check_port(AGENT_API_PORT)
     web_ok = not check_port(WEB_SERVER_PORT)
     gw_ok = not check_port(gw_port)
 
-    if web_ok and gw_ok:
+    if agent_ok and web_ok and gw_ok:
         echo_ok("所有服务已停止")
     else:
+        if not agent_ok:
+            echo_warn(f"端口 {AGENT_API_PORT} 仍被占用，可使用 --force 强制终止")
         if not web_ok:
             echo_warn(f"端口 {WEB_SERVER_PORT} 仍被占用，可使用 --force 强制终止")
         if not gw_ok:
@@ -855,6 +872,39 @@ def status():
 
     env = load_env()
     gw_port = int(env.get("GATEWAY_PORT", GATEWAY_PORT))
+
+    # ── Agent API 状态 ────────────────────────────────────────────────────
+    click.echo("")
+    click.echo("【Agent API】")
+
+    agent_running = check_port(AGENT_API_PORT)
+    if agent_running:
+        click.echo(f"  状态:     {click.style('运行中 ✔', fg='green')}")
+        click.echo(f"  端口:     {AGENT_API_PORT}")
+        click.echo(f"  地址:     http://127.0.0.1:{AGENT_API_PORT}")
+
+        # 尝试健康检查
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{AGENT_API_PORT}/v1/status",
+                headers={"Accept": "application/json"},
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                click.echo(f"  响应:     {click.style('正常', fg='green')}")
+                agent_info = data.get("agent", {})
+                model = agent_info.get("model", "-")
+                ctx_len = agent_info.get("context_length", "-")
+                uptime = agent_info.get("uptime", 0)
+                click.echo(f"  模型:     {model}")
+                click.echo(f"  上下文:   {ctx_len}")
+                click.echo(f"  运行时间: {uptime}s")
+        except Exception:
+            click.echo(f"  响应:     {click.style('异常', fg='yellow')}")
+    else:
+        click.echo(f"  状态:     {click.style('未运行 ✖', fg='red')}")
+        click.echo(f"  端口:     {AGENT_API_PORT} (未监听)")
 
     # ── WebServer 状态 ────────────────────────────────────────────────────
     click.echo("")
@@ -991,9 +1041,9 @@ def status():
 def chat(message, thread):
     """直接对话测试（与 Agent 交互）"""
 
-    # 检查 WebServer 是否运行
-    if not check_port(WEB_SERVER_PORT):
-        echo_error(f"WebServer 未运行 (端口 {WEB_SERVER_PORT})")
+    # 检查服务是否运行
+    if not check_port(AGENT_API_PORT) and not check_port(WEB_SERVER_PORT):
+        echo_error(f"Agent API ({AGENT_API_PORT}) 和 WebServer ({WEB_SERVER_PORT}) 均未运行")
         echo_info("请先运行: python dasheng.py start")
         sys.exit(1)
 
@@ -1025,8 +1075,16 @@ def chat(message, thread):
 
 
 def _send_chat(message: str, thread_id: str):
-    """发送消息到 WebServer API 并显示回复"""
-    url = f"http://127.0.0.1:{WEB_SERVER_PORT}/api/chat"
+    """发送消息到 Agent API 并显示回复"""
+    # 优先使用 Agent API，fallback WebServer
+    if check_port(AGENT_API_PORT):
+        url = f"http://127.0.0.1:{AGENT_API_PORT}/v1/chat"
+    elif check_port(WEB_SERVER_PORT):
+        url = f"http://127.0.0.1:{WEB_SERVER_PORT}/api/chat"
+    else:
+        echo_error("Agent API 和 WebServer 均未运行")
+        echo_info("请先运行: python dasheng.py start")
+        return
     payload = json.dumps({
         "message": message,
         "thread_id": thread_id,

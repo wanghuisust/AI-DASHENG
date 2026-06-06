@@ -35,7 +35,12 @@ def terminal_execute(command: str, timeout: int = 30) -> str:
             output += f"\n[stderr] {result.stderr}"
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
-        return output.strip() or "(无输出)"
+        output = output.strip() or "(无输出)"
+        # 截断过长输出，避免消息暴增导致 API 400
+        MAX_OUTPUT = 3000
+        if len(output) > MAX_OUTPUT:
+            output = output[:MAX_OUTPUT] + f"\n... (截断，共 {len(output)} 字符)"
+        return output
     except subprocess.TimeoutExpired:
         return f"[错误] 命令超时（{timeout}秒）"
     except Exception as e:

@@ -13,7 +13,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.base import Checkpoint
 
 
-DB_PATH = Path("data/conversations.db")
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "conversations.db"
 
 
 class ConversationStore:

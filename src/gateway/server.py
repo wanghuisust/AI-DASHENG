@@ -27,10 +27,12 @@ QQ 接入：QQ Bot 官方 API v2
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
 import urllib.request
+from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 加载 .env 配置
@@ -47,7 +49,7 @@ logger = logging.getLogger("gateway")
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
 
-DASHENG_API = os.getenv("DASHENG_API_URL", "http://127.0.0.1:7860")
+DASHENG_API = os.getenv("AGENT_API_URL", "http://127.0.0.1:8900")
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "data")
 
 # 全局适配器实例
@@ -58,40 +60,71 @@ _wechat: wechat_adapter.WeChatAdapter | None = None
 
 def call_agent(message: PlatformMessage) -> str:
     """调用 DASHENG Agent 处理消息（SSE 流式，先发进度再发结果）"""
-    url = f"{DASHENG_API}/api/chat/stream"
+    url = f"{DASHENG_API}/v1/chat/stream"
     payload = json.dumps({
         "message": message.text,
         "thread_id": message.chat_id,
     }).encode("utf-8")
 
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
+    import http.client
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    path = parsed.path or "/"
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            response_text = ""
-            event_type = ""
-            start_time = time.time()
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").strip()
+        conn = http.client.HTTPConnection(host, port, timeout=30)
+        conn.request("POST", path, body=payload, headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        })
+        resp = conn.getresponse()
+        # SSE 长连接：设 socket 级别超时 300s（每个 chunk 的等待上限）
+        # Agent API 每15秒发 keepalive 心跳，超时不会触发
+        if conn.sock:
+            conn.sock.settimeout(300)
+
+        if resp.status != 200:
+            logger.error(f"[Agent] SSE 返回 {resp.status}")
+            conn.close()
+            return f"抱歉，处理消息时出错(HTTP {resp.status})"
+
+        response_text = ""
+        event_type = ""
+        got_result = False
+        start_time = time.time()
+
+        # 逐行读 SSE，每行超时用 socket 级别控制
+        buf = b""
+        while True:
+            # 整体超时保护：10 分钟
+            if time.time() - start_time > 600:
+                logger.warning("[Agent] Agent 执行超 300s，强制结束")
+                if response_text:
+                    response_text += "\n\n⚠️ 响应超时，部分结果可能不完整。"
+                else:
+                    response_text = "抱歉，处理时间过长，请稍后重试。"
+                break
+
+            try:
+                chunk = resp.read(4096)
+            except socket.timeout:
+                # 单次读取超时，但整体还没超，继续等
+                continue
+            except Exception as e:
+                logger.warning(f"[Agent] SSE read exception: {type(e).__name__}: {e}")
+                break
+            if not chunk:
+                logger.info(f"[Agent] SSE connection closed by server after {time.time()-start_time:.0f}s")
+                break
+
+            buf += chunk
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
-                
-                # 整体超时保护：从开始消费算起 90 秒
-                if time.time() - start_time > 90:
-                    logger.warning("[Agent] Agent 执行超 90s，强制结束")
-                    if response_text:
-                        response_text += "\n\n⚠️ 响应超时，部分结果可能不完整。"
-                    else:
-                        response_text = "抱歉，处理时间过长，请简化问题或稍后重试。"
-                    break
-                
+
                 if line.startswith("event: "):
                     event_type = line[7:]
                 elif line.startswith("data: "):
@@ -108,26 +141,26 @@ def call_agent(message: PlatformMessage) -> str:
                             logger.info(f"[Agent] 工具完成: {data.get('tool', '?')}")
                     elif event_type == "result":
                         response_text = data.get("response", "")
+                        got_result = True
                     elif event_type == "error":
+                        conn.close()
                         return f"处理出错: {data.get('message', '未知错误')}"
 
-            if not response_text:
-                return "抱歉，处理超时，请稍后重试。"
+        conn.close()
+
+        if got_result:
             return response_text
-    except urllib.error.URLError as e:
-        if "timed out" in str(e):
-            logger.warning("[Agent] SSE 调用超时(120s)，fallback 到同步接口")
-            return _call_agent_sync(message)
-        logger.error(f"Agent SSE 调用失败: {e}")
-        return _call_agent_sync(message)
+        if not response_text:
+            return "抱歉，处理超时，请稍后重试。"
+        return response_text
     except Exception as e:
         logger.error(f"Agent SSE 调用异常: {e}")
-        return _call_agent_sync(message)
+        return f"抱歉，处理消息时出错"
 
 
 def _call_agent_sync(message: PlatformMessage) -> str:
     """同步调用 Agent（fallback）"""
-    url = f"{DASHENG_API}/api/chat"
+    url = f"{DASHENG_API}/v1/chat"
     payload = json.dumps({
         "message": message.text,
         "thread_id": message.chat_id,
@@ -140,7 +173,7 @@ def _call_agent_sync(message: PlatformMessage) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("response", "")
     except Exception as e:
