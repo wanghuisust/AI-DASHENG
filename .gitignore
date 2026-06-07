@@ -12,3 +12,7 @@ build/
 src/llama.cpp/
 src/$null
 src/data/
+nul
+tmp_*.py
+.hermes/
+src/2025-01-01

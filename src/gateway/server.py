@@ -59,102 +59,34 @@ _wechat: wechat_adapter.WeChatAdapter | None = None
 # ── Agent 调用 ───────────────────────────────────────────────────────────────
 
 def call_agent(message: PlatformMessage) -> str:
-    """调用 DASHENG Agent 处理消息（SSE 流式，先发进度再发结果）"""
-    url = f"{DASHENG_API}/v1/chat/stream"
+    """调用 DASHENG Agent 处理消息（同步调用，有超时保护）"""
+    url = f"{DASHENG_API}/v1/chat"
     payload = json.dumps({
         "message": message.text,
         "thread_id": message.chat_id,
     }).encode("utf-8")
 
-    import http.client
-    parsed = urlparse(url if "://" in url else f"http://{url}")
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 80
-    path = parsed.path or "/"
-
     try:
-        conn = http.client.HTTPConnection(host, port, timeout=30)
-        conn.request("POST", path, body=payload, headers={
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        })
-        resp = conn.getresponse()
-        # SSE 长连接：设 socket 级别超时 300s（每个 chunk 的等待上限）
-        # Agent API 每15秒发 keepalive 心跳，超时不会触发
-        if conn.sock:
-            conn.sock.settimeout(300)
-
-        if resp.status != 200:
-            logger.error(f"[Agent] SSE 返回 {resp.status}")
-            conn.close()
-            return f"抱歉，处理消息时出错(HTTP {resp.status})"
-
-        response_text = ""
-        event_type = ""
-        got_result = False
-        start_time = time.time()
-
-        # 逐行读 SSE，每行超时用 socket 级别控制
-        buf = b""
-        while True:
-            # 整体超时保护：10 分钟
-            if time.time() - start_time > 600:
-                logger.warning("[Agent] Agent 执行超 300s，强制结束")
-                if response_text:
-                    response_text += "\n\n⚠️ 响应超时，部分结果可能不完整。"
-                else:
-                    response_text = "抱歉，处理时间过长，请稍后重试。"
-                break
-
-            try:
-                chunk = resp.read(4096)
-            except socket.timeout:
-                # 单次读取超时，但整体还没超，继续等
-                continue
-            except Exception as e:
-                logger.warning(f"[Agent] SSE read exception: {type(e).__name__}: {e}")
-                break
-            if not chunk:
-                logger.info(f"[Agent] SSE connection closed by server after {time.time()-start_time:.0f}s")
-                break
-
-            buf += chunk
-            while b"\n" in buf:
-                line_bytes, buf = buf.split(b"\n", 1)
-                line = line_bytes.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-
-                if line.startswith("event: "):
-                    event_type = line[7:]
-                elif line.startswith("data: "):
-                    try:
-                        data = json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        continue
-
-                    if event_type == "status":
-                        step = data.get("step", "")
-                        if step == "tool_call":
-                            logger.info(f"[Agent] 调用工具: {data.get('tool', '?')}")
-                        elif step == "tool_done":
-                            logger.info(f"[Agent] 工具完成: {data.get('tool', '?')}")
-                    elif event_type == "result":
-                        response_text = data.get("response", "")
-                        got_result = True
-                    elif event_type == "error":
-                        conn.close()
-                        return f"处理出错: {data.get('message', '未知错误')}"
-
-        conn.close()
-
-        if got_result:
-            return response_text
-        if not response_text:
-            return "抱歉，处理超时，请稍后重试。"
-        return response_text
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("response", "")
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+            logger.error(f"[Agent] HTTP {e.code}: {err_body[:200]}")
+        except Exception:
+            logger.error(f"[Agent] HTTP {e.code}")
+        return f"抱歉，处理消息时出错(HTTP {e.code})"
+    except urllib.error.URLError as e:
+        logger.error(f"[Agent] 连接失败: {e.reason}")
+        return "抱歉，Agent 服务暂时不可用，请稍后再试。"
     except Exception as e:
-        logger.error(f"Agent SSE 调用异常: {e}")
+        logger.error(f"[Agent] 调用异常: {e}")
         return f"抱歉，处理消息时出错"
 
 
@@ -173,11 +105,79 @@ def _call_agent_sync(message: PlatformMessage) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("response", "")
     except Exception as e:
         logger.error(f"Agent 同步调用也失败: {e}")
+        return f"抱歉，处理消息时出错"
+
+
+def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock) -> str:
+    """调用 Agent 流式接口（SSE），实时更新 current_status"""
+    url = f"{DASHENG_API}/v1/chat/stream"
+    payload = json.dumps({
+        "message": message.text,
+        "thread_id": message.chat_id,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=1800)
+        response_text = ""
+        for line_bytes in resp:
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("event: "):
+                event_type = line[7:]
+            elif line.startswith("data: "):
+                data_str = line[6:]
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if event_type == "status":
+                    step = data.get("step", "")
+                    msg = data.get("message", "")
+                    content = data.get("content", "")
+                    tool = data.get("tool", "")
+                    with status_lock:
+                        if step == "thinking":
+                            current_status["message"] = "🤔 正在思考..."
+                        elif step == "reasoning":
+                            # 推理内容可能很长，只取前50字
+                            short = content[:50] + ("..." if len(content) > 50 else "")
+                            current_status["message"] = f"💭 推理中: {short}"
+                        elif step == "tool_call":
+                            current_status["message"] = f"🔧 正在调用: {tool}"
+                        elif step == "tool_done":
+                            current_status["message"] = f"✅ {tool} 执行完成"
+                        current_status["step"] = step
+                elif event_type == "result":
+                    response_text = data.get("response", "")
+                elif event_type == "error":
+                    logger.error(f"[Agent SSE] 错误: {data.get('message', '')}")
+                    response_text = f"抱歉，处理消息时出错: {data.get('message', '')}"
+        return response_text
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+            logger.error(f"[Agent SSE] HTTP {e.code}: {err_body[:200]}")
+        except Exception:
+            logger.error(f"[Agent SSE] HTTP {e.code}")
+        return f"抱歉，处理消息时出错(HTTP {e.code})"
+    except urllib.error.URLError as e:
+        logger.error(f"[Agent SSE] 连接失败: {e.reason}")
+        return "抱歉，Agent 服务暂时不可用，请稍后再试。"
+    except Exception as e:
+        logger.error(f"[Agent SSE] 流式调用异常: {e}")
         return f"抱歉，处理消息时出错"
 
 
@@ -191,17 +191,54 @@ def handle_message(message: PlatformMessage):
 
 
 def _process_and_reply(message: PlatformMessage):
-    """实际处理：调用 Agent → 发送回复"""
+    """实际处理：调用 Agent 流式接口，每30s推送当前步骤状态到 QQ"""
     try:
-        logger.info(f"[{message.platform}] 开始调用 Agent...")
-        reply_text = call_agent(message)
+        progress_stop = threading.Event()
+        current_status = {"step": "thinking", "message": "正在思考..."}
+        status_lock = threading.Lock()
+
+        def _send_progress():
+            """每60s发一次进度消息，附带当前步骤状态"""
+            count = 0
+            while not progress_stop.wait(60):
+                count += 1
+                with status_lock:
+                    step_text = current_status.get("message", "")
+                if count <= 3:
+                    text = f"⏳ 正在处理，请稍候...（{count * 60}秒）\n{step_text}"
+                else:
+                    text = f"⏳ 正在处理，请稍候...（{count * 60}秒）\n{step_text}\n任务流程长，请等待"
+                progress_reply = PlatformReply(
+                    platform=message.platform,
+                    chat_id=message.chat_id,
+                    text=text,
+                    is_group=message.is_group,
+                    at_user=message.user_id,
+                )
+                qq_adapter.send_reply(progress_reply)
+                logger.info(f"[QQ] 进度消息 #{count}: {step_text}")
+
+        progress_thread = None
+        if message.platform == "qq":
+            progress_thread = threading.Thread(target=_send_progress, daemon=True)
+            progress_thread.start()
+
+        # ── 调用 Agent 流式接口 ──
+        logger.info(f"[{message.platform}] 开始调用 Agent（流式）...")
+        reply_text = _call_agent_stream(message, current_status, status_lock)
+
+        # ── 停止进度消息 ──
+        if progress_thread:
+            progress_stop.set()
+            progress_thread.join(timeout=3)
+
         if not reply_text:
             logger.warning(f"[{message.platform}] Agent 返回空回复")
             return
 
         logger.info(f"[{message.platform}] Agent 回复: {reply_text[:80]}...")
 
-        # 发送回复
+        # ── 发送正式回复 ──
         reply = PlatformReply(
             platform=message.platform,
             chat_id=message.chat_id,

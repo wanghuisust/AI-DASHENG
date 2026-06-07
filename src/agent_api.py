@@ -56,7 +56,46 @@ _start_time = time.time()
 
 def get_messages(thread_id: str) -> list:
     if thread_id not in thread_messages:
-        thread_messages[thread_id] = []
+        # 尝试从 SQLite 恢复历史消息
+        db_msgs = store.get_messages(thread_id, limit=200)
+        if db_msgs:
+            restored = []
+            # 收集所有有效的 tool_call_id（来自 AI 消息的 tool_calls）
+            valid_tool_ids = set()
+            for m in db_msgs:
+                if m.get("role") == "ai":
+                    tc_str = m.get("tool_calls", "")
+                    if tc_str:
+                        try:
+                            tcs = json.loads(tc_str)
+                            for tc in tcs:
+                                # 从 tool_calls 中提取 id（如果有的话）
+                                tc_id = tc.get("id", "")
+                                if tc_id:
+                                    valid_tool_ids.add(tc_id)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+            for m in db_msgs:
+                role = m.get("role", "")
+                content = m.get("content", "")
+                if role == "human":
+                    restored.append(HumanMessage(content=content))
+                elif role == "ai":
+                    restored.append(AIMessage(content=content))
+                elif role == "tool":
+                    tool_call_id = m.get("tool_call_id", "")
+                    # 跳过孤立的 tool 消息（tool_call_id 不在任何 AI 消息的 tool_calls 中）
+                    if tool_call_id and tool_call_id not in valid_tool_ids:
+                        print(f"[RESTORE] Skipping orphan tool message: {tool_call_id}")
+                        continue
+                    if not tool_call_id:
+                        tool_call_id = f"restored_{m.get('tool_name', 'unknown')}_{int(time.time())}"
+                    restored.append(ToolMessage(content=content, name=m.get("tool_name", ""), tool_call_id=tool_call_id))
+            thread_messages[thread_id] = restored
+            print(f"[RESTORE] Restored {len(restored)} messages for thread {thread_id}")
+        else:
+            thread_messages[thread_id] = []
     return thread_messages[thread_id]
 
 
@@ -105,6 +144,7 @@ def save_ai_messages(thread_id: str, new_messages: list):
             content = str(content)
         tool_calls_str = ""
         tool_name = ""
+        tool_call_id = ""
         if role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
             tool_calls_str = json.dumps(
                 [{"name": tc["name"], "args": tc["args"]} for tc in msg.tool_calls],
@@ -112,7 +152,8 @@ def save_ai_messages(thread_id: str, new_messages: list):
             )
         elif role == "tool":
             tool_name = getattr(msg, "name", "")
-        store.save_message(thread_id, role, content, tool_calls_str, tool_name)
+            tool_call_id = getattr(msg, "tool_call_id", "")
+        store.save_message(thread_id, role, content, tool_calls_str, tool_name, tool_call_id)
 
 
 def extract_response(messages: list, prev_count: int) -> tuple[str, list]:
@@ -264,7 +305,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         print(f"[{ts}] POST /v1/chat message={user_msg[:80]} thread={thread_id}")
 
         try:
-            if not acquire_thread_lock(thread_id, timeout=300):
+            if not acquire_thread_lock(thread_id, timeout=1800):
                 self.send_json({"response": "当前会话正在处理中，请稍后再试", "thread_id": thread_id})
                 return
             try:
@@ -287,7 +328,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
                 t = threading.Thread(target=_run_graph)
                 t.start()
-                t.join(timeout=300)
+                t.join(timeout=1800)
 
                 if t.is_alive():
                     self.send_json({
@@ -376,7 +417,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         _ka_thread.start()
 
         try:
-            if not acquire_thread_lock(thread_id, timeout=300):
+            if not acquire_thread_lock(thread_id, timeout=1800):
                 sse_send("error", {"message": "当前会话正在处理中，请稍后再试"})
                 self.close_connection = True
                 return
@@ -391,10 +432,38 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 all_new_messages = []
                 tool_calls_seen = set()
 
-                for event in graph.stream(
-                    {"messages": messages},
-                    config={"recursion_limit": 128},
-                ):
+                # 用线程+超时保护 graph.stream，防止 LLM API 卡住
+                _stream_result = []
+                _stream_error = [None]
+
+                def _run_stream():
+                    try:
+                        for event in graph.stream(
+                            {"messages": messages},
+                            config={"recursion_limit": 128},
+                        ):
+                            if _stream_result is None:  # 被超时终止
+                                break
+                            _stream_result.append(event)
+                    except Exception as e:
+                        _stream_error[0] = e
+
+                _st = threading.Thread(target=_run_stream, daemon=True)
+                _st.start()
+                # 等待 graph.stream 完成，最多 1800 秒
+                _st.join(timeout=1800)
+
+                if _st.is_alive():
+                    # 超时了，终止线程
+                    _stream_result = None
+                    _st.join(timeout=5)
+                    sse_send("error", {"message": "处理超时，请稍后重试"})
+                    self.close_connection = True
+                    return
+                if _stream_error[0]:
+                    raise _stream_error[0]
+
+                for event in _stream_result:
                     for node_name, node_output in event.items():
                         if node_name == "agent":
                             msgs = node_output.get("messages", [])

@@ -65,11 +65,12 @@ class ConversationStore:
             ]
 
     def save_message(self, thread_id: str, role: str, content: str,
-                     tool_calls: str = "", tool_name: str = ""):
+                     tool_calls: str = "", tool_name: str = "",
+                     tool_call_id: str = ""):
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO messages (thread_id, role, content, tool_calls, tool_name) VALUES (?, ?, ?, ?, ?)",
-                (thread_id, role, content, tool_calls, tool_name)
+                "INSERT INTO messages (thread_id, role, content, tool_calls, tool_name, tool_call_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (thread_id, role, content, tool_calls, tool_name, tool_call_id)
             )
             conn.execute(
                 "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE thread_id = ?",
@@ -79,17 +80,19 @@ class ConversationStore:
     def get_messages(self, thread_id: str, limit: int = 100) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT role, content, tool_calls, tool_name, timestamp FROM messages "
+                "SELECT role, content, tool_calls, tool_name, tool_call_id, timestamp FROM messages "
                 "WHERE thread_id = ? ORDER BY id DESC LIMIT ?",
                 (thread_id, limit)
             ).fetchall()
             result = []
             for r in reversed(rows):
-                msg = {"role": r[0], "content": r[1], "timestamp": r[4]}
+                msg = {"role": r[0], "content": r[1], "timestamp": r[5]}
                 if r[2]:
                     msg["tool_calls"] = json.loads(r[2])
                 if r[3]:
                     msg["tool_name"] = r[3]
+                if r[4]:
+                    msg["tool_call_id"] = r[4]
                 result.append(msg)
             return result
 

@@ -680,12 +680,12 @@ class QQBotAdapter:
 
     # ── 发送回复 ─────────────────────────────────────────────────────────
 
-    def send_reply(self, reply) -> bool:
-        """Gateway 统一接口 — 发送 PlatformReply"""
+    def send_reply(self, reply) -> str:
+        """Gateway 统一接口 — 发送 PlatformReply，返回 msg_id（空字符串=失败）"""
         from .models import PlatformReply
 
         if not self._token_mgr:
-            return False
+            return ""
 
         if reply.is_group:
             group_openid = reply.chat_id.replace("qq_group_", "")
@@ -694,18 +694,18 @@ class QQBotAdapter:
             user_openid = reply.chat_id.replace("qq_c2c_", "")
             return self._send_c2c_msg(user_openid, reply.text)
 
-    def _send_c2c_msg(self, openid: str, text: str) -> bool:
-        """POST /v2/users/{openid}/messages"""
+    def _send_c2c_msg(self, openid: str, text: str) -> str:
+        """POST /v2/users/{openid}/messages → 返回 msg_id 或空字符串"""
         url = f"{self._token_mgr.api_base}/v2/users/{openid}/messages"
         return self._post_message(url, text, msg_type=0, msg_seq=int(time.time()) % 2147483647)
 
-    def _send_group_msg(self, group_openid: str, text: str) -> bool:
-        """POST /v2/groups/{group_openid}/messages"""
+    def _send_group_msg(self, group_openid: str, text: str) -> str:
+        """POST /v2/groups/{group_openid}/messages → 返回 msg_id 或空字符串"""
         url = f"{self._token_mgr.api_base}/v2/groups/{group_openid}/messages"
         return self._post_message(url, text, msg_type=0, msg_seq=int(time.time()) % 2147483647)
 
-    def _post_message(self, url: str, text: str, msg_type: int = 0, msg_seq: int = 1) -> bool:
-        """发送消息 HTTP 请求"""
+    def _post_message(self, url: str, text: str, msg_type: int = 0, msg_seq: int = 1) -> str:
+        """发送消息 HTTP 请求 → 返回 msg_id（空字符串表示失败）"""
         headers = self._token_mgr.auth_header()
         headers["Content-Type"] = "application/json"
 
@@ -726,19 +726,45 @@ class QQBotAdapter:
                 msg_id = result.get("id", "")
                 if msg_id:
                     logger.info(f"QQ: 消息发送成功 id={msg_id}")
-                    return True
+                    return msg_id
                 # 检查错误码
                 code = result.get("code", -1)
                 if code == 0:
-                    return True
+                    return ""
                 logger.error(f"QQ: 消息发送失败: {result}")
-                return False
+                return ""
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"QQ: 消息发送 HTTP 错误 {e.code}: {body}")
-            return False
+            return ""
         except Exception as e:
             logger.error(f"QQ: 消息发送失败: {e}")
+            return ""
+
+    def _recall_message(self, openid_or_group: str, msg_id: str, is_group: bool = False) -> bool:
+        """撤回消息（2分钟内可撤回）
+        
+        C2C:  DELETE /v2/users/{openid}/messages/{message_id}
+        群聊: DELETE /v2/groups/{group_openid}/messages/{message_id}
+        """
+        if is_group:
+            url = f"{self._token_mgr.api_base}/v2/groups/{openid_or_group}/messages/{msg_id}"
+        else:
+            url = f"{self._token_mgr.api_base}/v2/users/{openid_or_group}/messages/{msg_id}"
+
+        headers = self._token_mgr.auth_header()
+        req = urllib.request.Request(url, headers=headers, method="DELETE")
+
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                logger.info(f"QQ: 消息撤回成功 id={msg_id}")
+                return True
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            logger.warning(f"QQ: 消息撤回失败 {e.code}: {body} (msg_id={msg_id})")
+            return False
+        except Exception as e:
+            logger.warning(f"QQ: 消息撤回异常: {e} (msg_id={msg_id})")
             return False
 
     # ── 停止 ─────────────────────────────────────────────────────────────
@@ -784,11 +810,27 @@ def start_listener(on_message: Callable) -> bool:
     return _adapter.is_connected
 
 
-def send_reply(reply) -> bool:
-    """Gateway 统一发送"""
+def send_reply(reply) -> str:
+    """Gateway 统一发送，返回 msg_id"""
     if _adapter:
         return _adapter.send_reply(reply)
-    return False
+    return ""
+
+
+def recall_message(chat_id: str, msg_id: str) -> bool:
+    """撤回 QQ 消息（2分钟内可撤回）
+    
+    chat_id: 带前缀的 chat_id（如 qq_c2c_xxx 或 qq_group_xxx）
+    msg_id: 要撤回的消息 ID
+    """
+    if not _adapter:
+        return False
+    if chat_id.startswith("qq_group_"):
+        group_openid = chat_id.replace("qq_group_", "")
+        return _adapter._recall_message(group_openid, msg_id, is_group=True)
+    else:
+        user_openid = chat_id.replace("qq_c2c_", "")
+        return _adapter._recall_message(user_openid, msg_id, is_group=False)
 
 
 def get_config() -> dict:
