@@ -16,3 +16,4 @@ nul
 tmp_*.py
 .hermes/
 src/2025-01-01
+"!data/.cache/"  
