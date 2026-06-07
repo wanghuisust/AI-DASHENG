@@ -1,4 +1,4 @@
-# AI-DASHENG — 基于 LangGraph 的本地 AI Agent
+# AI-DASHENG — 本地 AI Agent
 
 本地运行的 AI Agent，可以操控你的电脑执行命令、读写文件、搜索文件、网络搜索。支持 QQ Bot 消息接入。
 
@@ -11,11 +11,11 @@
 
   QQ / 微信 ───▶ Gateway (:9090) ───▶ Agent API (:8900)
                     │                      │
-                    │  消息路由 + 进度推送      │  LangGraph Agent 循环
+                    │  消息路由 + 进度推送      │  Agent 推理循环
                     │                      │
                     │                      ├─▶ LLM 思考 (OpenAI 协议)
                     │                      │      │
-                    │                      │      ├─ tool_calls → ToolNode 执行
+                    │                      │      ├─ tool_calls → 工具执行
                     │                      │      │       │
                     │                      │       │  ├─ terminal_execute (终端命令)
                     │                      │       │  ├─ read_file / write_file (文件读写)
@@ -31,7 +31,7 @@
 **三个服务：**
 | 服务 | 端口 | 说明 |
 |------|------|------|
-| Agent API | 8900 | 核心 Agent 推理，LangGraph 图执行 |
+| Agent API | 8900 | 核心 Agent 推理 |
 | WebServer | 7860 | Web Dashboard + Chat UI |
 | Gateway | 9090 | QQ/微信消息路由 + 进度推送 |
 
@@ -204,7 +204,7 @@ AI-DASHENG/
 ├── start_all_hidden.vbs    # Windows 后台启动脚本（自动生成）
 ├── src/
 │   ├── agent_api.py        # Agent API 服务 (:8900)
-│   ├── graph.py            # LangGraph Agent 图定义
+│   ├── graph.py            # Agent 图定义
 │   ├── web_server.py       # Web Dashboard (:7860)
 │   ├── persistence.py      # 消息持久化（SQLite）
 │   ├── context_compress.py # 上下文压缩
@@ -216,7 +216,7 @@ AI-DASHENG/
 │   │   ├── file_tool.py
 │   │   ├── search_tool.py
 │   │   ├── web_search_tool.py
-│   │   └── memory_tool.py
+│   │   └─ memory_tool.py
 │   └── gateway/            # 消息网关
 │       ├── server.py       # Gateway 服务 (:9090)
 │       └── qq_adapter.py   # QQ Bot 适配器
