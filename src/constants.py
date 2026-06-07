@@ -2,14 +2,20 @@
 
 import os
 
-# 从 .env 读取模型上下文长度（token 数），默认 50000
-MODEL_CONTEXT_LENGTH = int(os.environ.get("MODEL_CONTEXT_LENGTH", "50000"))
 
-# 最大上下文 token 数（用于 trim 和压缩判断）
-MAX_CONTEXT_TOKENS = MODEL_CONTEXT_LENGTH
+def _get_model_context_length() -> int:
+    """延迟读取 MODEL_CONTEXT_LENGTH，确保 load_dotenv 已执行"""
+    return int(os.environ.get("MODEL_CONTEXT_LENGTH", "256000"))
+
+
+# 最大上下文 token 数（用于 trim 和压缩判断）— 延迟读取
+def get_max_context_tokens() -> int:
+    return _get_model_context_length()
+
 
 # 上下文压缩阈值：达到上下文长度的 50% 时自动压缩
-COMPRESS_THRESHOLD = int(MODEL_CONTEXT_LENGTH * 0.5)
+def get_compress_threshold() -> int:
+    return int(_get_model_context_length() * 0.5)
 
 
 def estimate_tokens(text: str) -> int:
@@ -24,8 +30,10 @@ def estimate_tokens(text: str) -> int:
     return int(cn * 1.5 + other * 0.4)
 
 
-def trim_messages_to_tokens(msgs: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> list:
+def trim_messages_to_tokens(msgs: list, max_tokens: int = None) -> list:
     """从最新消息开始保留，确保总 token 不超限"""
+    if max_tokens is None:
+        max_tokens = get_max_context_tokens()
     total = 0
     kept = []
     for msg in reversed(msgs):

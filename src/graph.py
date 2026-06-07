@@ -30,7 +30,7 @@ from tools import ALL_TOOLS
 from memory import Memory
 from skills import SkillManager
 from context_compress import compress_messages
-from constants import estimate_tokens, MAX_CONTEXT_TOKENS, trim_messages_to_tokens
+from constants import estimate_tokens, get_max_context_tokens, trim_messages_to_tokens
 
 # ── State 定义 ──────────────────────────────────────────────
 

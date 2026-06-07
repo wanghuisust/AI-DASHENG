@@ -130,18 +130,26 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
     try:
         resp = urllib.request.urlopen(req, timeout=1800)
         response_text = ""
+        logger.debug(f"[SSE] Connected to {url}, reading events...")
         for line_bytes in resp:
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
+            if line.startswith(": "):
+                logger.debug(f"[SSE] keepalive")
+                continue
             if line.startswith("event: "):
                 event_type = line[7:]
+                logger.debug(f"[SSE] event: {event_type}")
             elif line.startswith("data: "):
                 data_str = line[6:]
                 try:
                     data = json.loads(data_str)
                 except json.JSONDecodeError:
+                    logger.debug(f"[SSE] non-json data: {data_str[:100]}")
                     continue
+
+                logger.debug(f"[SSE] {event_type}: {json.dumps(data, ensure_ascii=False)[:200]}")
 
                 if event_type == "status":
                     step = data.get("step", "")
@@ -342,7 +350,7 @@ def main():
 
     sh = logging.StreamHandler(SafeStream(sys.stdout))
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format=log_format,
         handlers=[
             sh,

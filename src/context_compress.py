@@ -6,7 +6,7 @@
 """
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from constants import estimate_tokens, COMPRESS_THRESHOLD
+from constants import estimate_tokens, get_compress_threshold
 
 KEEP_RECENT = 6
 
@@ -43,7 +43,7 @@ def compress_messages(messages: list, llm=None) -> list:
         return messages
 
     total = sum(estimate_tokens(getattr(m, "content", "") or "") + 10 for m in messages)
-    if total < COMPRESS_THRESHOLD:
+    if total < get_compress_threshold():
         return messages
 
     old_msgs = messages[:-KEEP_RECENT]

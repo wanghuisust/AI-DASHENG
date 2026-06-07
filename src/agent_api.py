@@ -82,7 +82,17 @@ def get_messages(thread_id: str) -> list:
                 if role == "human":
                     restored.append(HumanMessage(content=content))
                 elif role == "ai":
-                    restored.append(AIMessage(content=content))
+                    # 恢复 AIMessage 时带上 tool_calls，否则后续 ToolMessage 会变成孤立消息
+                    ai_kwargs = {"content": content}
+                    tc_str = m.get("tool_calls", "")
+                    if tc_str:
+                        try:
+                            tcs = json.loads(tc_str)
+                            if tcs:
+                                ai_kwargs["tool_calls"] = tcs
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    restored.append(AIMessage(**ai_kwargs))
                 elif role == "tool":
                     tool_call_id = m.get("tool_call_id", "")
                     # 跳过孤立的 tool 消息（tool_call_id 不在任何 AI 消息的 tool_calls 中）
@@ -147,7 +157,7 @@ def save_ai_messages(thread_id: str, new_messages: list):
         tool_call_id = ""
         if role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
             tool_calls_str = json.dumps(
-                [{"name": tc["name"], "args": tc["args"]} for tc in msg.tool_calls],
+                [{"name": tc["name"], "args": tc["args"], "id": tc.get("id", "")} for tc in msg.tool_calls],
                 ensure_ascii=False,
             )
         elif role == "tool":
@@ -426,7 +436,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 prev_count = len(messages)
                 store.create_thread(thread_id)
                 messages.append(HumanMessage(content=user_msg))
-
+                import datetime as _dt
+                _ts = _dt.datetime.now().strftime("%H:%M:%S")
+                print(f"[{_ts}] [STREAM] thread={thread_id} history={prev_count} msgs, new msg={user_msg[:80]}", flush=True)
                 sse_send("status", {"step": "thinking", "message": "正在思考..."})
 
                 all_new_messages = []
