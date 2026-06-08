@@ -343,6 +343,13 @@ def install():
         capture_output=True, timeout=60
     )
 
+    # 3.5 确保 qrcode 已安装（微信扫码绑定需要）
+    echo_info("确保 qrcode 已安装（微信扫码绑定需要）...")
+    subprocess.run(
+        [str(VENV_PYTHON), "-m", "pip", "install", "-q", "qrcode"],
+        capture_output=True, timeout=60
+    )
+
     # 4. 确保 websocket-client 已安装（Gateway 依赖，装到 .venv）
     echo_info("确保 websocket-client 已安装...")
     subprocess.run(
