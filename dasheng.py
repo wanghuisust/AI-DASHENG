@@ -200,7 +200,7 @@ def find_pythonw_processes() -> list:
     try:
         result = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq pythonw.exe", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, encoding='utf-8', errors='replace', text=True, timeout=10
         )
         procs = []
         for line in result.stdout.strip().split("\n"):
@@ -226,7 +226,7 @@ def find_python_processes() -> list:
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"IMAGENAME eq {imagename}", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, encoding='utf-8', errors='replace', text=True, timeout=10
             )
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
@@ -358,7 +358,7 @@ def install():
         result = subprocess.run(
             [str(VENV_PYTHON), "-m", "pip", "install", "-r", str(req_file)],
             timeout=600,
-            capture_output=True, text=True
+            capture_output=True, text=True, encoding='utf-8', errors='replace'
         )
         if result.returncode != 0:
             echo_error(f"依赖安装失败 (code={result.returncode}):\n{result.stderr[-500:]}\n{result.stdout[-500:]}")
@@ -397,7 +397,7 @@ def install():
     echo_info("注册 dasheng 全局命令...")
     result = subprocess.run(
         [str(VENV_PYTHON), "-m", "pip", "install", "-e", str(PROJECT_DIR), "-q"],
-        capture_output=True, text=True, timeout=120
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120
     )
     if result.returncode == 0:
         echo_ok("dasheng 命令已注册（在 .venv 中可用: dasheng --help）")
@@ -909,7 +909,7 @@ def stop(force):
         try:
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, encoding='utf-8', errors='replace', text=True, timeout=10
             )
             for line in result.stdout.split("\n"):
                 if f":{AGENT_API_PORT}" in line and "LISTENING" in line:
@@ -930,7 +930,7 @@ def stop(force):
         try:
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, encoding='utf-8', errors='replace', text=True, timeout=10
             )
             for line in result.stdout.split("\n"):
                 if f":{WEB_SERVER_PORT}" in line and "LISTENING" in line:
@@ -952,7 +952,7 @@ def stop(force):
         try:
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, encoding='utf-8', errors='replace', text=True, timeout=10
             )
             for line in result.stdout.split("\n"):
                 if f":{gw_port}" in line and "LISTENING" in line:
