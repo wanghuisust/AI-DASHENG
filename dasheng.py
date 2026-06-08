@@ -383,6 +383,50 @@ def install():
     echo_ok("安装完成！下一步: dasheng setup")
 
 
+# ── 微信扫码辅助 ──────────────────────────────────────────────────────────
+
+def _do_wechat_qr_login(env: dict, cred_store):
+    """在 setup 阶段执行微信扫码绑定（也可跳过）"""
+    from src.gateway.wechat_adapter import qr_login
+
+    do_scan = click.prompt(
+        "是否现在扫码绑定微信？(y=扫码 / s=跳过稍后绑定)",
+        type=str, default="y"
+    )
+
+    if do_scan.lower() in ("s", "skip", "跳过"):
+        echo_info("已跳过微信扫码，Gateway 启动时将自动触发扫码登录")
+        env["ILINK_BOT_TOKEN"] = ""
+        env["ILINK_ACCOUNT_ID"] = ""
+        click.echo("")
+        return
+
+    # 执行扫码登录
+    echo_info("正在获取微信二维码...")
+    echo_info("请打开微信扫一扫，扫描下方二维码")
+    click.echo("")
+
+    import asyncio
+    try:
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(qr_login(str(PROJECT_DIR / "data")))
+        loop.close()
+    except Exception as e:
+        echo_error(f"扫码登录异常: {e}")
+        result = None
+
+    if result:
+        env["ILINK_BOT_TOKEN"] = result.get("token", "")
+        env["ILINK_ACCOUNT_ID"] = result.get("account_id", "")
+        echo_ok(f"微信扫码绑定成功！account={result.get('account_id', '')[:8]}...")
+    else:
+        echo_warn("微信扫码未完成，Gateway 启动时将重试")
+        env["ILINK_BOT_TOKEN"] = ""
+        env["ILINK_ACCOUNT_ID"] = ""
+
+    click.echo("")
+
+
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -531,21 +575,40 @@ def setup():
         env["WECHAT_ENABLED"] = "true"
         click.echo("")
         echo_info("微信接入使用 iLink Bot API（微信官方开放协议）")
-        echo_info("首次启动时需要用微信扫描二维码登录")
-        echo_info("扫码流程将在 Gateway 启动后自动触发")
-        click.echo("")
 
-        # iLink 配置（如果有）
-        current_ilink_token = env.get("ILINK_BOT_TOKEN", "")
-        if current_ilink_token:
-            echo_ok(f"已有 iLink Token: {current_ilink_token[:8]}...")
-            keep = click.prompt("保留现有 Token？(y/n)", type=str, default="y")
-            if keep.lower() not in ("y", "yes"):
-                env["ILINK_BOT_TOKEN"] = ""
-                env["ILINK_ACCOUNT_ID"] = ""
-                echo_info("已清除旧 Token，下次启动将重新扫码")
+        # 检查依赖
+        try:
+            import aiohttp
+            import cryptography
+        except ImportError as e:
+            echo_error(f"微信适配器依赖缺失: {e}")
+            echo_info("安装: pip install aiohttp cryptography")
+            echo_info("跳过微信扫码，可在安装依赖后重新运行 setup")
+            env["WECHAT_ENABLED"] = "false"
+            click.echo("")
+            click.echo("")
         else:
-            echo_info("首次使用，启动后请按提示扫码登录微信")
+            # 检查是否已有有效凭证
+            from src.gateway.wechat_adapter import CredentialStore
+            cred_store = CredentialStore(str(PROJECT_DIR / "data"))
+            active_creds = cred_store.load_active()
+
+            if active_creds:
+                echo_ok(f"已有微信凭证: account={active_creds.get('account_id', '')[:8]}...")
+                rebind = click.prompt("是否重新扫码绑定？(y/n)", type=str, default="n")
+                if rebind.lower() not in ("y", "yes"):
+                    # 保留现有凭证，写入 .env
+                    env["ILINK_BOT_TOKEN"] = active_creds.get("token", "")
+                    env["ILINK_ACCOUNT_ID"] = active_creds.get("account_id", "")
+                    echo_ok("保留现有微信绑定")
+                    click.echo("")
+                    click.echo("")
+                else:
+                    # 清除旧凭证，重新扫码
+                    _do_wechat_qr_login(env, cred_store)
+            else:
+                # 首次绑定 — 直接扫码
+                _do_wechat_qr_login(env, cred_store)
     else:
         env["WECHAT_ENABLED"] = "false"
         echo_info("跳过微信配置")
