@@ -237,46 +237,62 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
             _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
         print(f"[{_ts}] [LLM] invoke OK: {_resp_chars} chars{_resp_tc}", flush=True)
         
-        # ── 空意图重试：LLM 说要调工具但没生成 tool_calls ──
+        # ── 空意图重试：LLM 说要做什么但没生成 tool_calls ──
         if not (hasattr(response, 'tool_calls') and response.tool_calls) and response.content:
             _content = response.content if isinstance(response.content, str) else str(response.content)
-            # 检测"让我...通过/查询/调用"这种空意图模式
-            import re
-            INTENT_PATTERNS = [
-                r"让我.{0,6}(通过|用|调用|查询|搜索|来|使用|尝试|抓取|获取|看看|帮你|为您)",
-                r"我来.{0,4}(查询|搜索|调用|使用|试试|看看|帮你)",
-                r"我将.{0,4}(使用|调用|通过|尝试)",
-                r"我(帮|为)你.{0,4}(查|搜|看|找|获取)",
-            ]
-            _has_intent = any(re.search(p, _content) for p in INTENT_PATTERNS)
-            if _has_intent:
-                print(f"[{_ts}] [EMPTY-INTENT] LLM说要用工具但没生成tool_calls，重试一次", flush=True)
-                # 追加AI回复 + 提示HumanMessage，让LLM真正调工具
-                retry_messages = full_messages + [response, HumanMessage(
-                    content="[系统提示：你刚才说了要用工具但没有生成tool_call。请直接调用对应的工具函数，不要只说'让我查询'。如果工具不可用，就直接告诉用户。]"
-                )]
-                _retry_result = [None]
-                _retry_error = [None]
-                def _do_retry():
-                    try:
-                        _retry_result[0] = llm.invoke(retry_messages)
-                    except Exception as e:
-                        _retry_error[0] = e
-                _retry_thread = threading.Thread(target=_do_retry, daemon=True)
-                _retry_thread.start()
-                while _retry_thread.is_alive():
-                    if cancel_event and cancel_event.is_set():
-                        return {"messages": [AIMessage(content="(请求已取消)")]}
-                    _retry_thread.join(timeout=2)
-                if _retry_error[0]:
-                    print(f"[{_ts}] [EMPTY-INTENT] 重试失败: {str(_retry_error[0])[:200]}", flush=True)
-                elif _retry_result[0]:
+            # 空意图判定：短回复(<150字) + 没有实质性结果内容
+            # "实质"= LLM 实际给出了数据/列表/路径/代码，而不是复述用户意图
+            _has_substance = any(kw in _content for kw in [
+                "：\n", ":\n", "```", "1.", "2.", "•", "►",
+                "G:\\", "C:\\", "/home", "http://", "https://",
+                "详细如下", "列出如下", "找到以下", "结果如下",
+            ]) or len(_content) >= 150  # 长回复大概率有实质内容
+            _is_intent_only = not _has_substance
+            
+            if _is_intent_only:
+                print(f"[{_ts}] [EMPTY-INTENT] LLM回复太短且无实质内容: '{_content[:60]}'，重试", flush=True)
+                # 最多重试3次，逐步加强提示
+                _retry_prompts = [
+                    "[系统提示：你刚才只说了要做事但没有调用工具。请直接调用工具函数，不要只说'让我查询'。]",
+                    "[系统警告：你连续两次只说不做！必须立即调用工具，否则无法完成任务。直接输出tool_call。]",
+                    "[系统强制：这是最后一次机会。立刻调用terminal_execute或其他工具，不要再输出任何文字说明。]",
+                ]
+                for _ri, _prompt in enumerate(_retry_prompts):
+                    retry_messages = full_messages + [response, HumanMessage(content=_prompt)]
+                    _retry_result = [None]
+                    _retry_error = [None]
+                    def _do_retry(_msgs=retry_messages):
+                        try:
+                            _retry_result[0] = llm.invoke(_msgs)
+                        except Exception as e:
+                            _retry_error[0] = e
+                    _retry_thread = threading.Thread(target=_do_retry, daemon=True)
+                    _retry_thread.start()
+                    while _retry_thread.is_alive():
+                        if cancel_event and cancel_event.is_set():
+                            return {"messages": [AIMessage(content="(请求已取消)")]}
+                        _retry_thread.join(timeout=2)
+                    if _retry_error[0]:
+                        print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}失败: {str(_retry_error[0])[:200]}", flush=True)
+                        break
                     response = _retry_result[0]
                     _resp_chars = len(str(response.content)) if response.content else 0
                     _resp_tc = ''
                     if hasattr(response, 'tool_calls') and response.tool_calls:
                         _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
-                    print(f"[{_ts}] [EMPTY-INTENT] 重试OK: {_resp_chars} chars{_resp_tc}", flush=True)
+                        print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}成功: {_resp_chars} chars{_resp_tc}", flush=True)
+                        break  # 成功生成tool_calls，退出重试
+                    # 检查重试结果是否有实质内容
+                    _retry_content = response.content if isinstance(response.content, str) else str(response.content or "")
+                    _retry_has_substance = any(kw in _retry_content for kw in [
+                        "：\n", ":\n", "```", "1.", "2.", "G:\\", "C:\\",
+                        "详细如下", "列出如下", "找到以下", "结果如下",
+                    ]) or len(_retry_content) >= 150
+                    if _retry_has_substance:
+                        print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}给出实质内容: {_resp_chars} chars", flush=True)
+                        break
+                    print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}仍无tool_call: '{_retry_content[:60]}'", flush=True)
+                    # 继续下一次重试
     except Exception as e:
         import traceback as _tb
         _error_full = str(e)
@@ -295,11 +311,171 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
 
 
 def should_continue(state: AgentState) -> Literal["tools", "end"]:
-    """条件边：判断 LLM 是否要调用工具"""
+    """条件边：判断 LLM 是否要调用工具，同时检测死循环
+    
+    参考 Hermes Agent 的 ToolCallGuardrailController，实现三层循环检测：
+    1. 精确重复（exact_failure）：同工具+同参数反复调用
+    2. 同类重复（same_tool）：同工具名反复调用（不同参数）
+    3. 交替循环（alternating_loop）：两个工具交替调用
+    """
     last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+    if not (hasattr(last_message, "tool_calls") and last_message.tool_calls):
+        return "end"
+
+    # ── 收集最近的工具调用+结果历史 ──
+    # 格式：[(tool_name, args_hash, result_hash), ...]，按时间正序
+    import hashlib
+    import json as _json
+
+    recent_calls = []  # [(tool_name, args_hash), ...]
+    recent_results = []  # [result_hash, ...] 对应每次调用的结果摘要
+    # 同时收集 tool 结果消息，用于判断是否在进步
+    _tool_results = []  # [(tool_call_id, result_hash), ...]
+    for msg in state["messages"]:
+        if hasattr(msg, "type") and msg.type == "tool":
+            _content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            _tcid = getattr(msg, "tool_call_id", "")
+            _tool_results.append((_tcid, hashlib.md5(_content[:500].encode()).hexdigest()[:8]))
+
+    for msg in reversed(state["messages"]):
+        if hasattr(msg, "type") and msg.type == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    args_str = _json.dumps(tc["args"], sort_keys=True, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    args_str = str(tc.get("args", {}))
+                args_hash = hashlib.md5(args_str.encode()).hexdigest()[:8]
+                recent_calls.append((tc["name"], args_hash))
+                # 找对应的结果 hash
+                _tcid = tc.get("id", "")
+                _res_hash = ""
+                for _tid, _rh in _tool_results:
+                    if _tid == _tcid:
+                        _res_hash = _rh
+                        break
+                recent_results.append(_res_hash)
+        elif hasattr(msg, "type") and msg.type == "tool":
+            continue  # 跳过工具结果消息
+        else:
+            break  # 遇到非工具链消息就停
+    recent_calls.reverse()
+    recent_results.reverse()
+
+    if not recent_calls:
         return "tools"
-    return "end"
+
+    import datetime as _dt
+    _ts = _dt.datetime.now().strftime("%H:%M:%S")
+
+    # ── 辅助：判断同工具名的最近几次调用是否在"进步" ──
+    # 进步 = 最近的结果不全相同（说明每次返回了不同信息，正在探索）
+    def _is_making_progress(tool_name: str, min_calls: int = 3) -> bool:
+        """检查该工具最近 min_calls 次调用的结果是否互不相同（在进步）"""
+        _results = [recent_results[i] for i, (tn, _) in enumerate(recent_calls) if tn == tool_name]
+        if len(_results) < min_calls:
+            return False  # 次数不够，无法判断
+        _last_n = _results[-min_calls:]
+        # 如果结果 hash 不全相同，说明在产出新信息
+        unique = set(_last_n)
+        if len(unique) > 1:
+            return True  # 结果在变化 → 在探索
+        return False  # 结果都一样 → 在死循环
+
+    # ── 检测1：精确重复 — 同工具+同参数出现 3 次以上 ──
+    # 改进：同参数≠死循环，如果返回了不同结果说明环境在变，放行
+    EXACT_REPEAT_LIMIT = 3        # 同参数调3次以上才考虑
+    EXACT_REPEAT_HARD_LIMIT = 5   # 同参数硬上限
+
+    call_signatures = {}  # (tool_name, args_hash) → count
+    for tool_name, args_hash in recent_calls:
+        sig = (tool_name, args_hash)
+        call_signatures[sig] = call_signatures.get(sig, 0) + 1
+
+    for (tool_name, args_hash), count in call_signatures.items():
+        if count >= EXACT_REPEAT_HARD_LIMIT:
+            # 硬上限，无论如何杀
+            print(f"[{_ts}] [LOOP-DETECT] 精确重复硬上限: {tool_name}(args_hash={args_hash}) 被调用 {count} 次，强制结束", flush=True)
+            last_message.tool_calls = []
+            if not last_message.content:
+                last_message.content = f"抱歉，{tool_name} 被重复调用了太多次（参数相同），已自动停止。请换一种方式提问。"
+            return "end"
+        if count >= EXACT_REPEAT_LIMIT:
+            # 检查同参数调用的结果是否在变化
+            _sig_results = []
+            for i, (tn, ah) in enumerate(recent_calls):
+                if tn == tool_name and ah == args_hash:
+                    _sig_results.append(recent_results[i])
+            _unique_results = set(_sig_results)
+            if len(_unique_results) <= 1 or "" in _sig_results:
+                # 结果都一样（或还没拿到结果）→ 真死循环
+                print(f"[{_ts}] [LOOP-DETECT] 精确重复(无进步): {tool_name}(args_hash={args_hash}) 被调用 {count} 次，结果相同，强制结束", flush=True)
+                last_message.tool_calls = []
+                if not last_message.content:
+                    last_message.content = f"抱歉，{tool_name} 被重复调用了太多次（参数相同，结果相同），已自动停止。请换一种方式提问。"
+                return "end"
+            else:
+                # 同参数但返回了不同结果 → 环境/状态在变，不是死循环
+                print(f"[{_ts}] [LOOP-DETECT] 精确重复但结果在变化: {tool_name}(args_hash={args_hash}) {count}次，放行", flush=True)
+
+    # ── 检测2：同类重复 — 同工具名出现多次 ──
+    # 关键改进：如果每次返回不同结果（在进步/探索），只打警告不杀；只有真正死循环才杀
+    SAME_TOOL_LIMIT = 8       # 同工具调 8 次以上才考虑（给足探索空间）
+    SAME_TOOL_HARD_LIMIT = 15 # 硬上限，无论如何超过就杀
+
+    tool_name_counts = {}
+    for tool_name, _ in recent_calls:
+        tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
+
+    for tool_name, count in tool_name_counts.items():
+        if count >= SAME_TOOL_HARD_LIMIT:
+            print(f"[{_ts}] [LOOP-DETECT] 硬上限: {tool_name} 被调用 {count} 次（上限{SAME_TOOL_HARD_LIMIT}），强制结束", flush=True)
+            last_message.tool_calls = []
+            if not last_message.content:
+                last_message.content = f"抱歉，{tool_name} 调用次数已达上限（{count}次），已自动停止。"
+            return "end"
+        if count >= SAME_TOOL_LIMIT:
+            if _is_making_progress(tool_name):
+                # 在进步 → 不杀，但在 LLM 上下文中注入提示让它收敛
+                print(f"[{_ts}] [LOOP-DETECT] 同工具 {tool_name} 调用 {count} 次但在进步，注入收敛提示", flush=True)
+                # 给最后一条 AI 消息追加提示，引导 LLM 总结现有结果
+                if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+                    # 在 tool_call 的消息里塞一段 content 提示
+                    _hint = (f"\n[系统警告：{tool_name} 已调用 {count} 次。"
+                             f"请基于已有结果总结回答用户，不要再调用 {tool_name}。"
+                             f"如果信息不足，直接告诉用户你找到了什么。]")
+                    if last_message.content:
+                        last_message.content += _hint
+                    else:
+                        last_message.content = _hint
+                return "tools"  # 放行这次，让 LLM 看到提示后自己收敛
+            else:
+                # 没进步（结果都一样）→ 真死循环，杀
+                print(f"[{_ts}] [LOOP-DETECT] 同类重复(无进步): {tool_name} 被调用 {count} 次，结果均相同，强制结束", flush=True)
+                last_message.tool_calls = []
+                if not last_message.content:
+                    last_message.content = f"抱歉，{tool_name} 被反复调用了 {count} 次（结果均相同），已自动停止。请换一种方式提问。"
+                return "end"
+
+    # ── 检测3：交替循环 — 最近 8 次调用只涉及 2 个工具名交替 ──
+    # 同样加入进步检测：如果交替调用产出了不同结果，不算死循环
+    if len(recent_calls) >= 10:
+        last_8_names = [name for name, _ in recent_calls[-10:]]
+        unique_names = set(last_8_names)
+        if len(unique_names) <= 2:
+            # 检查最近几次的结果是否在变化
+            _last_results = recent_results[-6:]
+            if len(set(_last_results)) <= 2:
+                # 结果也在重复 → 真循环
+                print(f"[{_ts}] [LOOP-DETECT] 交替循环(无进步): 最近10次调用仅涉及 {unique_names}，结果重复，强制结束", flush=True)
+                last_message.tool_calls = []
+                if not last_message.content:
+                    last_message.content = "抱歉，检测到工具调用陷入循环，已自动停止。请换一种方式提问或稍后重试。"
+                return "end"
+            else:
+                # 交替但产出不同结果 → 在探索
+                print(f"[{_ts}] [LOOP-DETECT] 交替调用但结果在变化，放行", flush=True)
+
+    return "tools"
 
 
 # ── 构建图 ──────────────────────────────────────────────────

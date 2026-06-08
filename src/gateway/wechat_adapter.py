@@ -22,6 +22,7 @@ import logging
 import os
 import secrets
 import struct
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -391,6 +392,7 @@ class WeChatAdapter:
         self._connected = False
         self._session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
+        self._poll_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._consecutive_failures = 0
         self._seen_msgs: Dict[Any, float] = {}
@@ -442,8 +444,14 @@ class WeChatAdapter:
             self._base_url = result.get("base_url", ILINK_BASE_URL)
             self._user_id = result.get("user_id", "")
 
-        # 启动长轮询
+        # 启动长轮询 — 在独立线程中运行事件循环
         self._loop.run_until_complete(self._start_polling())
+        self._poll_thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="wechat-poll",
+        )
+        self._poll_thread.start()
         return True
 
     def start_listener(self, on_message) -> bool:
@@ -613,7 +621,7 @@ class WeChatAdapter:
         """Gateway 统一接口 — 发送 PlatformReply"""
         from .models import PlatformReply
 
-        user_id = reply.chat_id.replace("wc_", "") if reply.is_group else reply.user_id
+        user_id = reply.chat_id.replace("wc_", "") if reply.is_group else reply.at_user
         # 群聊时 to_user_id 用群 ID
         if reply.is_group:
             user_id = reply.chat_id.replace("wc_", "")
@@ -652,14 +660,60 @@ class WeChatAdapter:
 
     # ── Typing 指示 ──────────────────────────────────────────────────────────
 
-    async def send_typing(self, to_user_id: str, typing_ticket: str):
-        """发送"正在输入"指示"""
+    TYPING_CACHE_TTL = 600  # typing_ticket 缓存 10 分钟
+
+    async def _fetch_typing_ticket(self, user_id: str, context_token: str = "") -> str:
+        """调 getconfig API 获取 typing_ticket（带缓存）"""
+        # 检查缓存
+        cached = self._typing_cache.get(user_id)
+        if cached:
+            ticket, ts = cached
+            if time.time() - ts < self.TYPING_CACHE_TTL:
+                return ticket
+
+        # 调 API
         try:
-            await _api_post(self._session, self._base_url, EP_SEND_TYPING,
+            payload: Dict[str, Any] = {"ilink_user_id": user_id}
+            if context_token:
+                payload["context_token"] = context_token
+            resp = await _api_post(self._session, self._base_url, EP_GET_CONFIG,
+                                   payload, self._token, CONFIG_TIMEOUT_MS)
+            ticket = str(resp.get("typing_ticket") or "")
+            if ticket:
+                self._typing_cache[user_id] = (ticket, time.time())
+                logger.info(f"微信: 获取 typing_ticket 成功 user={user_id[:16]}...")
+                return ticket
+            else:
+                logger.debug(f"微信: getconfig 返回空 typing_ticket, resp keys={list(resp.keys())}")
+        except Exception as e:
+            logger.warning(f"微信: getconfig 获取 typing_ticket 失败: {e}")
+        return ""
+
+    async def _send_typing_async(self, to_user_id: str, context_token: str = ""):
+        """发送"正在输入"指示（内部 async 实现）— 自动获取 typing_ticket"""
+        if not self._session or not self._connected:
+            return
+        typing_ticket = await self._fetch_typing_ticket(to_user_id, context_token)
+        if not typing_ticket:
+            logger.debug(f"微信 typing 跳过: 无 typing_ticket user={to_user_id[:16]}...")
+            return
+        try:
+            result = await _api_post(self._session, self._base_url, EP_SEND_TYPING,
                             {"ilink_user_id": to_user_id, "typing_ticket": typing_ticket, "status": 1},
                             self._token, CONFIG_TIMEOUT_MS)
-        except Exception:
-            pass
+            logger.debug(f"微信 typing OK: user={to_user_id[:16]}...")
+        except Exception as e:
+            logger.warning(f"微信 typing 失败: {e}")
+
+    def send_typing(self, to_user_id: str, context_token: str = ""):
+        """发送"正在输入"指示（同步入口，可从任意线程调用）"""
+        if not self._loop or self._loop.is_closed() or not self._connected:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_typing_async(to_user_id, context_token), self._loop)
+        except Exception as e:
+            logger.warning(f"微信 send_typing 调度失败: {e}")
 
     # ── 停止 ─────────────────────────────────────────────────────────────────
 

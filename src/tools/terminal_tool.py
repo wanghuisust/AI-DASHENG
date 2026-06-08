@@ -19,13 +19,15 @@ def terminal_execute(command: str, timeout: int = 60) -> str:
 
     try:
         is_windows = platform.system() == "Windows"
+        # Windows cmd 输出是 GBK/CP936，不能硬编码 utf-8
+        enc = "gbk" if is_windows else "utf-8"
         result = subprocess.run(
             command if is_windows else ["/bin/bash", "-c", command],
             shell=is_windows,
             capture_output=True,
             text=True,
             timeout=timeout,
-            encoding="utf-8",
+            encoding=enc,
             errors="replace",
         )
         output = ""

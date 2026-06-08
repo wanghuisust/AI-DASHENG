@@ -22,3 +22,5 @@ tmp_*.cookie.txt
 check_ws.py
 .hermes/
 src/2025-01-01
+
+data/wechat/

@@ -35,7 +35,7 @@ load_dotenv(env_path, override=True)
 
 from graph import build_graph
 from persistence import get_store
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 # ── 请求取消机制 ──────────────────────────────────────────────
 # thread_id → Event：当 set 时，对应的流式请求应停止
@@ -182,6 +182,97 @@ def extract_response(messages: list, prev_count: int) -> tuple[str, list]:
             if msg.content:
                 response_text = msg.content
     return response_text, tool_calls_info
+
+
+def _fix_empty_intent_response(response_text: str, messages: list) -> str:
+    """检测空意图回复（只有'我来帮你查'之类的声明没有实际内容），自动用无工具 LLM 总结。
+    返回修正后的 response_text。
+    """
+    import re
+    if not response_text:
+        print(f"[EMPTY-RESULT] 完全无回复，自动总结", flush=True)
+        try:
+            return _summarize_without_tools(messages)
+        except Exception as se:
+            print(f"[EMPTY-RESULT] 总结失败: {se}", flush=True)
+            return "抱歉，处理完成但未能生成回复，请重试。"
+
+    EMPTY_INTENT_PATTERNS = [
+        r"^(我来|让我|我来帮你|让我来|我将|好的[，。]?\s*(我来|让我|我帮你))",
+        r"^(我帮你|我来为你|我来查|让我查|让我看|我来看看|我来找)",
+        r"^(好的[，。]?\s*(主人|亲|先生|女士|用户)?[，。]?\s*(我来|让我|我帮你))",
+        r"^(好的[，。]?\s*我再)",
+    ]
+    _has_substance = any(kw in response_text for kw in [
+        "：\n", ":\n", "```", "1.", "2.", "G:\\", "C:\\",
+        "详细如下", "列出如下", "找到以下", "结果如下",
+    ]) or len(response_text) >= 150
+    is_empty_intent = not _has_substance
+    if is_empty_intent:
+        print(f"[EMPTY-RESULT] 回复是空意图: '{response_text[:60]}'，自动总结", flush=True)
+        try:
+            return _summarize_without_tools(messages)
+        except Exception as se:
+            print(f"[EMPTY-RESULT] 总结失败: {se}", flush=True)
+            return response_text + "\n\n（Agent 执行了多步操作但未能生成完整总结，请尝试更具体的提问。）"
+
+    return response_text
+
+
+def _summarize_without_tools(messages: list) -> str:
+    """到达 recursion_limit 或循环检测后，去掉工具做一次纯文本 LLM 请求让模型总结。
+    参考 Hermes Agent 的 handle_max_iterations 机制。
+    """
+    from graph import create_llm, SYSTEM_PROMPT
+    from memory import Memory
+    
+    # 创建不带工具的 LLM（纯文本模式）
+    llm_no_tools = create_llm()
+    
+    # 构建总结请求：压缩工具调用为摘要，保留关键信息
+    summary_messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    
+    memory = Memory()
+    memory_context = memory.get_context()
+    if memory_context:
+        summary_messages[0] = SystemMessage(content=SYSTEM_PROMPT + f"\n\n{memory_context}")
+    
+    for msg in messages:
+        role = getattr(msg, "type", None)
+        if role == "human":
+            summary_messages.append(HumanMessage(content=msg.content if isinstance(msg.content, str) else str(msg.content)))
+        elif role == "ai":
+            content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+            has_tool_calls = hasattr(msg, "tool_calls") and msg.tool_calls
+            if has_tool_calls:
+                # 压缩：把 tool_calls 摘要为文本
+                tc_names = [tc["name"] for tc in msg.tool_calls]
+                tc_summary = f"[调用工具: {', '.join(tc_names)}]"
+                if content:
+                    summary_messages.append(AIMessage(content=f"{content[:200]} {tc_summary}"))
+                else:
+                    summary_messages.append(AIMessage(content=tc_summary))
+            elif content:
+                summary_messages.append(AIMessage(content=content[:500]))
+        elif role == "tool":
+            # 保留工具结果（截断到 300 字避免太长）
+            tool_content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+            tool_name = getattr(msg, "name", "tool")
+            summary_messages.append(AIMessage(content=f"[{tool_name}结果]: {tool_content[:300]}"))
+    
+    # 追加总结请求
+    summary_messages.append(HumanMessage(
+        content="你已经执行了多步操作但达到了迭代上限或被循环检测终止。请总结你已经完成的工作和发现，直接回复用户，不要再调用任何工具。"
+    ))
+    
+    # 截断到合理长度
+    total_chars = sum(len(str(m.content)) for m in summary_messages if hasattr(m, 'content'))
+    if total_chars > 30000:
+        # 只保留 system + 最后几条 + 总结请求
+        summary_messages = [summary_messages[0]] + summary_messages[-5:]
+    
+    response = llm_no_tools.invoke(summary_messages)
+    return response.content if response.content else "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
 
 
 # ── Gateway 状态检查 ────────────────────────────────────────
@@ -361,10 +452,20 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     try:
                         invoke_result[0] = graph.invoke(
                             {"messages": messages},
-                            config={"recursion_limit": 128},
+                            config={"recursion_limit": 40},
                         )
                     except Exception as e:
-                        invoke_error[0] = e
+                        # GraphRecursionError: 达到 recursion_limit
+                        if "recursion" in str(e).lower() or "RecursionError" in type(e).__name__:
+                            print(f"[RECURSION-LIMIT] 达到迭代上限，尝试无工具总结", flush=True)
+                            try:
+                                summary = _summarize_without_tools(messages)
+                                invoke_result[0] = {"messages": messages + [AIMessage(content=summary)]}
+                            except Exception as se:
+                                print(f"[RECURSION-LIMIT] 总结失败: {se}", flush=True)
+                                invoke_result[0] = {"messages": messages + [AIMessage(content="抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。")]}
+                        else:
+                            invoke_error[0] = e
 
                 t = threading.Thread(target=_run_graph)
                 t.start()
@@ -386,6 +487,8 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 save_ai_messages(thread_id, messages[prev_count:])
 
                 response_text, tool_calls_info = extract_response(messages, prev_count)
+                # ── 空意图检测 ──
+                response_text = _fix_empty_intent_response(response_text, messages)
                 self.send_json({
                     "response": response_text,
                     "tool_calls": tool_calls_info if tool_calls_info else None,
@@ -496,7 +599,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                         _step = 0
                         for event in _cancelable_graph.stream(
                             {"messages": messages},
-                            config={"recursion_limit": 128},
+                            config={"recursion_limit": 40},
                         ):
                             _step += 1
                             _nodes = list(event.keys())
@@ -520,7 +623,18 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                             _event_queue.put(event, timeout=1800)
                     except Exception as e:
                         print(f"[STREAM-EVENT] ERROR: {type(e).__name__}: {str(e)[:300]}", flush=True)
-                        _stream_error[0] = e
+                        # GraphRecursionError: 达到 recursion_limit，尝试总结
+                        if "recursion" in str(e).lower() or "RecursionError" in type(e).__name__:
+                            print(f"[STREAM-RECURSION-LIMIT] 达到迭代上限，尝试无工具总结", flush=True)
+                            try:
+                                summary = _summarize_without_tools(messages)
+                                # 把总结作为一个特殊的 agent event 注入队列
+                                _event_queue.put({"agent": {"messages": [AIMessage(content=summary)]}}, timeout=60)
+                            except Exception as se:
+                                print(f"[STREAM-RECURSION-LIMIT] 总结失败: {se}", flush=True)
+                                _event_queue.put({"agent": {"messages": [AIMessage(content="抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。")]}}, timeout=60)
+                        else:
+                            _stream_error[0] = e
                     finally:
                         print(f"[STREAM-EVENT] DONE, total_steps={_step}", flush=True)
                         _event_queue.put(None)  # sentinel
@@ -575,15 +689,27 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                                                 "tool": tc["name"],
                                                 "message": f"正在调用 {tc['name']}...",
                                             })
+                                elif msg.content and isinstance(msg.content, str) and msg.content.strip():
+                                    # AI 有思考内容但没有 tool_calls → 推送思考文本
+                                    # 类似 Hermes 的"thinking aloud"效果
+                                    sse_send("status", {
+                                        "step": "thinking",
+                                        "content": msg.content.strip(),
+                                    })
                         elif node_name == "tools":
                             msgs = node_output.get("messages", [])
                             for msg in msgs:
                                 all_new_messages.append(msg)
                                 tool_name = getattr(msg, "name", "未知工具")
+                                # 工具结果内容，截断到 200 字用于进度展示
+                                tool_content = ""
+                                if msg.content:
+                                    tool_content = str(msg.content)[:200]
                                 sse_send("status", {
                                     "step": "tool_done",
                                     "tool": tool_name,
                                     "message": f"{tool_name} 执行完成",
+                                    "content": tool_content,
                                 })
 
                 if _stream_error[0]:
@@ -595,11 +721,15 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
                 response_text, tool_calls_info = extract_response(result_messages, prev_count)
 
+                # ── 空意图检测：回复只有意图声明没有实际内容时，自动用无工具 LLM 总结 ──
+                response_text = _fix_empty_intent_response(response_text, result_messages)
+
                 sse_send("result", {
                     "response": response_text,
                     "tool_calls": tool_calls_info if tool_calls_info else None,
                     "thread_id": thread_id,
                 })
+                sse_send("done", {})  # 显式结束标记，让 gateway 立即断开
                 self.close_connection = True
             finally:
                 release_thread_lock(thread_id)

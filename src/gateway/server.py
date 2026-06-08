@@ -113,9 +113,10 @@ def _call_agent_sync(message: PlatformMessage) -> str:
         return f"抱歉，处理消息时出错"
 
 
-def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock, cancel_event: threading.Event = None) -> str:
+def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock, cancel_event: threading.Event = None, on_status=None) -> str:
     """调用 Agent 流式接口（SSE），实时更新 current_status
     cancel_event: 如果被 set，中止 SSE 读取
+    on_status: 回调函数 on_status(step, data)，收到 status 事件时调用，用于实时推送进度
     """
     url = f"{DASHENG_API}/v1/chat/stream"
     payload = json.dumps({
@@ -173,7 +174,7 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                     tool = data.get("tool", "")
                     with status_lock:
                         if step == "thinking":
-                            current_status["message"] = "🤔 正在思考..."
+                            current_status["message"] = content[:80] if content else "🤔 正在思考..."
                         elif step == "reasoning":
                             # 推理内容可能很长，只取前50字
                             short = content[:50] + ("..." if len(content) > 50 else "")
@@ -183,8 +184,25 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                         elif step == "tool_done":
                             current_status["message"] = f"✅ {tool} 执行完成\n▶️ 继续下一步…"
                         current_status["step"] = step
+                    # 回调：实时推送进度给客户端
+                    if on_status:
+                        try:
+                            on_status(step, data)
+                        except Exception as e:
+                            logger.warning(f"[on_status] 回调异常: {e}")
                 elif event_type == "result":
                     response_text = data.get("response", "")
+                    # 收到最终回复，清掉 thinking 类的 pending steps（避免和 result 内容重复）
+                    if on_status:
+                        try:
+                            on_status("final_result", data)
+                        except Exception:
+                            pass
+                    # result 是最终回复，收到后立即跳出，不再等 SSE EOF
+                    break
+                elif event_type == "done":
+                    # 服务端显式结束标记
+                    break
                 elif event_type == "error":
                     logger.error(f"[Agent SSE] 错误: {data.get('message', '')}")
                     response_text = f"抱歉，处理消息时出错: {data.get('message', '')}"
@@ -278,6 +296,31 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         current_status = {"step": "thinking", "message": "正在思考..."}
         status_lock = threading.Lock()
 
+        # ── 微信：发送"正在输入"指示 + 周期续命 ──
+        def _wechat_typing_loop():
+            """周期性发送 typing 指示（iLink typing 有时效，需每4秒续一次）"""
+            count = 0
+            while not progress_stop.wait(4):
+                if cancel_event.is_set():
+                    return
+                count += 1
+                try:
+                    _wechat.send_typing(message.user_id, message.raw.get("context_token", ""))
+                except Exception:
+                    pass  # typing 失败不影响主流程
+
+        wechat_typing_thread = None
+        if message.platform == "wechat" and _wechat:
+            # 立即发一次 typing
+            try:
+                _ctx_token = message.raw.get("context_token", "")
+                logger.info(f"[wechat-typing] 立即发送: user={message.user_id[:20]}... context_token={'有' if _ctx_token else '无'}")
+                _wechat.send_typing(message.user_id, _ctx_token)
+            except Exception as e:
+                logger.warning(f"[wechat-typing] 首次发送失败: {e}")
+            wechat_typing_thread = threading.Thread(target=_wechat_typing_loop, daemon=True)
+            wechat_typing_thread.start()
+
         # ── 发送开始处理通知（如果取消了前一个，_cancel_active_request 已发过通知） ──
 
         def _send_progress():
@@ -308,14 +351,177 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             progress_thread = threading.Thread(target=_send_progress, daemon=True)
             progress_thread.start()
 
+        # ── 实时进度推送回调（微信用） ──
+        _progress_history = []           # 已推送的进度列表
+        PROGRESS_FLUSH_INTERVAL = 5.0    # 合并发送间隔（秒）
+        _pending_steps = []              # 待发送的步骤
+        _last_flush_time = [0.0]         # 上次发送时间
+        _flush_timer = [None]            # 定时器
+
+        def _flush_progress():
+            """合并发送积攒的步骤"""
+            if not _pending_steps:
+                return
+            steps = _pending_steps.copy()
+            _pending_steps.clear()
+            _last_flush_time[0] = time.time()
+
+            # ── 合并同类步骤 ──
+            # 把连续的同类 tool_call/tool_done 合并
+            merged = []
+            for s in steps:
+                last = merged[-1] if merged else None
+                if last and last["type"] == s["type"] and last.get("tool") == s.get("tool"):
+                    # 同类合并：计数+1
+                    last["count"] = last.get("count", 1) + 1
+                    # 保留最后一个的结果（如果有）
+                    if s.get("result"):
+                        last["result"] = s["result"]
+                else:
+                    merged.append(s.copy())
+
+            # ── 构造文本 ──
+            lines = []
+            for m in merged:
+                if m["type"] == "tool_call":
+                    cnt = m.get("count", 1)
+                    if cnt > 1:
+                        lines.append(f"🔧 调用 {m['tool']}×{cnt}")
+                    else:
+                        lines.append(f"🔧 调用 {m['tool']}")
+                elif m["type"] == "tool_done":
+                    cnt = m.get("count", 1)
+                    result = m.get("result", "")
+                    # 摘要：只显示统计数，不显示具体文件名/路径（对用户无用，最终 result 会包含）
+                    summary = ""
+                    if result and len(result) > 5:
+                        result_lines = [l for l in result.split("\n") if l.strip()]
+                        num_items = len(result_lines)
+                        # 检查是否有错误标志
+                        is_error = any(kw in result[:200] for kw in ["[stderr]", "error", "Error", "不是内部或外部命令", "拒绝访问"])
+                        if is_error:
+                            # 简述错误
+                            err_line = result_lines[0][:30] if result_lines else "执行出错"
+                            summary = f"⚠️ {err_line}"
+                        elif num_items > 1:
+                            # 多行结果，只报数量
+                            last_line = result_lines[-1].strip() if result_lines else ""
+                            if any(kw in last_line for kw in ["个文件", "个目录", "File(s)", "Dir(s)", "字节", "bytes"]):
+                                summary = last_line[:40]
+                            else:
+                                summary = f"{num_items} 项结果"
+                        # 单行结果不显示（太短没意义）
+                    if summary:
+                        if cnt > 1:
+                            lines.append(f"✅ {m['tool']}×{cnt} → {summary}")
+                        else:
+                            lines.append(f"✅ {m['tool']} → {summary}")
+                    else:
+                        if cnt > 1:
+                            lines.append(f"✅ {m['tool']}×{cnt} 完成")
+                        else:
+                            lines.append(f"✅ {m['tool']} 完成")
+                elif m["type"] == "thinking":
+                    lines.append(f"💭 {m.get('text', '')[:80]}")
+
+            text = "\n".join(lines)
+            if not text:
+                return
+
+            _progress_history.append(text)
+            logger.info(f"[wechat-progress] 合并发送: {text[:80]}")
+            try:
+                progress_reply = PlatformReply(
+                    platform="wechat",
+                    chat_id=message.chat_id,
+                    text=text,
+                    is_group=message.is_group,
+                    at_user=message.user_id,
+                )
+                _wechat.send_reply(progress_reply)
+            except Exception as e:
+                logger.warning(f"[wechat-progress] 发送失败: {e}")
+
+        def _on_status(step: str, data: dict):
+            """SSE status 回调：攒步骤，定时合并推送给微信"""
+            if message.platform != "wechat" or not _wechat:
+                return
+            if cancel_event.is_set():
+                return
+
+            now = time.time()
+            tool = data.get("tool", "")
+            content = data.get("content", "")
+
+            # ── 收到最终回复，清掉 thinking 避免和 result 重复 ──
+            if step == "final_result":
+                # 只保留 tool 类步骤，清掉 thinking（因为 result 会包含完整回复）
+                _pending_steps[:] = [s for s in _pending_steps if s["type"] in ("tool_call", "tool_done")]
+                # 如果还有 tool 步骤没发，立即 flush
+                if _pending_steps:
+                    _flush_progress()
+                return
+
+            # ── 构造步骤条目 ──
+            if step == "tool_call":
+                _pending_steps.append({"type": "tool_call", "tool": tool})
+            elif step == "tool_done":
+                # 工具结果，取前500字用于智能摘要（不能只取100字，否则行数统计不准）
+                tool_content = data.get("content", "") or data.get("message", "")
+                short_result = tool_content[:500].strip() if tool_content else ""
+                _pending_steps.append({"type": "tool_done", "tool": tool, "result": short_result})
+            elif step in ("thinking", "reasoning"):
+                if not content or len(content) < 5:
+                    return
+                # 过滤纯意图声明
+                import re
+                _skip_patterns = [r"^(好的[，。]?\s*(主人|亲)?[，。]?\s*(我来|让我|我帮你))",
+                                  r"^(我来|让我|我来帮你|我来查|让我查)"]
+                if any(re.search(p, content) for p in _skip_patterns) and len(content) < 30:
+                    return
+                _pending_steps.append({"type": "thinking", "text": content[:80]})
+            else:
+                return
+
+            # ── 5秒定时器：到了就合并发送 ──
+            # 取消上一个定时器，重新计时
+            if _flush_timer[0]:
+                try:
+                    _flush_timer[0].cancel()
+                except Exception:
+                    pass
+            _flush_timer[0] = threading.Timer(PROGRESS_FLUSH_INTERVAL, _flush_progress)
+            _flush_timer[0].daemon = True
+            _flush_timer[0].start()
+
+            # ── 如果积攒超过 8 条，立即发送（避免积压太久） ──
+            if len(_pending_steps) >= 8:
+                if _flush_timer[0]:
+                    try:
+                        _flush_timer[0].cancel()
+                    except Exception:
+                        pass
+                _flush_progress()
+
         # ── 调用 Agent 流式接口 ──
         logger.info(f"[{message.platform}] 开始调用 Agent（流式）...")
-        reply_text = _call_agent_stream(message, current_status, status_lock, cancel_event)
+        reply_text = _call_agent_stream(message, current_status, status_lock, cancel_event, on_status=_on_status)
 
-        # ── 停止进度消息 ──
+        # ── flush 剩余的进度步骤（最后一批可能还在 pending） ──
+        if _flush_timer[0]:
+            try:
+                _flush_timer[0].cancel()
+            except Exception:
+                pass
+        if _pending_steps:
+            _flush_progress()
+
+        # ── 停止进度消息 & typing loop ──
+        progress_stop.set()  # 通知 typing loop 和 progress thread 停止
         if progress_thread:
-            progress_stop.set()
             progress_thread.join(timeout=3)
+        if wechat_typing_thread:
+            wechat_typing_thread.join(timeout=3)
 
         # ── 如果被取消，不发回复（新请求会自己发） ──
         if cancel_event.is_set():
@@ -338,9 +544,17 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         )
 
         if message.platform == "wechat" and _wechat:
-            _wechat.send_reply(reply)
+            try:
+                _wechat.send_reply(reply)
+            except Exception as e:
+                logger.error(f"微信发送回复异常: {e}")
         elif message.platform == "qq":
-            qq_adapter.send_reply(reply)
+            try:
+                qq_adapter.send_reply(reply)
+            except Exception as e:
+                logger.error(f"QQ发送回复异常: {e}")
+        elif message.platform == "wechat":
+            logger.warning("微信消息但适配器未启动，无法回复")
         else:
             logger.warning(f"未知平台: {message.platform}")
     except Exception as e:
@@ -456,21 +670,72 @@ def main():
     # 不需要 WeChatFerry！不需要 DLL 注入！
     # 启动时如果没有保存的凭证，会弹出二维码让微信扫码
     global _wechat
-    _wechat = None  # 暂不启动微信，先测 QQ
+    _wechat = None
     wechat_ok = False
+    WECHAT_ENABLED = os.getenv("WECHAT_ENABLED", "true").lower() == "true"
+    if WECHAT_ENABLED:
+        try:
+            _wechat = wechat_adapter.WeChatAdapter(DATA_DIR)
+            wechat_ok = _wechat.start_listener(handle_message)
+            if wechat_ok:
+                logger.info("WeChat iLink Bot connected")
+            else:
+                logger.warning("WeChat not connected (扫码登录失败，继续运行QQ通道)")
+                _wechat = None  # 避免后续调用失败的适配器
+        except Exception as e:
+            logger.error(f"WeChat 启动异常: {e}，跳过微信通道")
+            _wechat = None
+    else:
+        logger.info("WeChat disabled (WECHAT_ENABLED != true)")
 
     # ── QQ：Bot 官方 API v2 ──────────────────────────────────────────
-    qq_ok = qq_adapter.start_listener(handle_message)
-    if qq_ok:
-        logger.info("QQ Bot API connected")
+    # QQ start_listener 是阻塞式（内含重连循环），必须在独立线程中运行
+    qq_ok = False
+    QQ_ENABLED = os.getenv("QQ_ENABLED", "true").lower() == "true"
+    if QQ_ENABLED:
+        try:
+            ok, msg = qq_adapter.check_requirements()
+            if ok:
+                # 预先获取 token 验证配置是否正确
+                _qq_token_mgr = qq_adapter.TokenManager(
+                    os.getenv("QQ_APP_ID", ""),
+                    os.getenv("QQ_APP_SECRET", ""),
+                    os.getenv("QQ_IS_SANDBOX", "false").lower() in ("true", "1", "yes"),
+                )
+                _test_token = _qq_token_mgr.get_token()
+                if _test_token:
+                    qq_ok = True
+                    # 在后台线程启动 QQ 适配器（start_listener 内含重连循环，会阻塞）
+                    qq_thread = threading.Thread(
+                        target=qq_adapter.start_listener,
+                        args=(handle_message,),
+                        daemon=True,
+                        name="qq-listener",
+                    )
+                    qq_thread.start()
+                    logger.info("QQ Bot API 启动中（后台线程）")
+                else:
+                    logger.warning("QQ not connected (access_token 获取失败)，继续运行微信通道")
+            else:
+                logger.warning(f"QQ 依赖缺失: {msg}，继续运行微信通道")
+        except Exception as e:
+            logger.error(f"QQ 启动异常: {e}，跳过QQ通道")
     else:
-        logger.warning("QQ not connected (请配置 QQ_APP_ID / QQ_APP_SECRET)")
+        logger.info("QQ disabled (QQ_ENABLED != true)")
 
     # ── HTTP Server ───────────────────────────────────────────────────────
     server = HTTPServer((host, port), GatewayHandler)
     logger.info(f"DASHENG Gateway: {host}:{port}")
-    logger.info(f"  WeChat: iLink Bot API (扫码登录)")
-    logger.info(f"  QQ:     Bot API v2 (AppID + WebSocket)")
+    if _wechat:
+        logger.info(f"  WeChat: iLink Bot API ✓ (已连接)")
+    elif WECHAT_ENABLED:
+        logger.info(f"  WeChat: iLink Bot API ✗ (连接失败)")
+    else:
+        logger.info(f"  WeChat: disabled")
+    if qq_ok:
+        logger.info(f"  QQ:     Bot API v2 ✓ (已连接)")
+    else:
+        logger.info(f"  QQ:     Bot API v2 ✗ (未连接)")
     logger.info(f"  Agent:  {DASHENG_API}")
 
     try:
