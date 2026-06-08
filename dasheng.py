@@ -54,7 +54,17 @@ if sys.platform == "win32":
 
 # 支持 DASHENG_HOME 环境变量指定项目目录（pip install 后全局可用）
 # 默认用 __file__ 所在目录（开发模式下直接在项目根目录运行）
-PROJECT_DIR = Path(os.environ.get("DASHENG_HOME", "")).resolve() if os.environ.get("DASHENG_HOME") else Path(__file__).resolve().parent
+# 如果 DASHENG_HOME 指向的目录不存在或不包含项目文件，fallback 到 __file__ 所在目录
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ENV_HOME = Path(os.environ.get("DASHENG_HOME", "")).resolve() if os.environ.get("DASHENG_HOME") else None
+if _ENV_HOME and (_ENV_HOME / "requirements.txt").exists() and (_ENV_HOME / "src").is_dir():
+    PROJECT_DIR = _ENV_HOME
+elif _ENV_HOME:
+    # DASHENG_HOME 指向了错误路径，fallback
+    print(f"⚠ DASHENG_HOME={_ENV_HOME} 不是有效的项目目录，使用脚本所在目录: {_SCRIPT_DIR}")
+    PROJECT_DIR = _SCRIPT_DIR
+else:
+    PROJECT_DIR = _SCRIPT_DIR
 SRC_DIR = PROJECT_DIR / "src"
 VENV_DIR = PROJECT_DIR / ".venv"
 ENV_FILE = PROJECT_DIR / ".env"
