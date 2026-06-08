@@ -50,10 +50,15 @@ def create_llm(model: str = None, base_url: str = None, api_key: str = None):
     env_path = Path(__file__).resolve().parent.parent / ".env"
     load_dotenv(env_path)
 
+    _model = model or os.getenv("MODEL_NAME", "gpt-4o-mini")
+    _base_url = base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    _api_key = api_key or os.getenv("OPENAI_API_KEY")
+    print(f"[LLM-INIT] model={_model} base_url={_base_url} api_key={(_api_key or '')[:8]}...", flush=True)
+
     llm = ChatOpenAI(
-        model=model or os.getenv("MODEL_NAME", "gpt-4o-mini"),
-        base_url=base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        model=_model,
+        base_url=_base_url,
+        api_key=_api_key,
         temperature=0.3,
         # 单次 LLM 调用超时 60 秒（Agnes 免费版较慢）
         request_timeout=60,
