@@ -39,13 +39,31 @@ class ConversationStore:
                 content TEXT DEFAULT '',
                 tool_calls TEXT DEFAULT '',
                 tool_name TEXT DEFAULT '',
+                tool_call_id TEXT DEFAULT '',
                 timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (thread_id) REFERENCES conversations(thread_id)
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(thread_id)")
+            # 自动迁移：给旧表补缺失的列
+            self._migrate_columns(conn)
 
     def _conn(self):
         return sqlite3.connect(str(self.db_path))
+
+    # 已知列定义：列名 → 类型（新表已包含这些列，旧表可能缺失）
+    _KNOWN_COLUMNS = {
+        "tool_call_id": "TEXT DEFAULT ''",
+    }
+
+    def _migrate_columns(self, conn):
+        """检查 messages 表是否有缺失的列，自动补上"""
+        try:
+            existing = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        except Exception:
+            return
+        for col, col_type in self._KNOWN_COLUMNS.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {col_type}")
 
     def create_thread(self, thread_id: str, title: str = ""):
         with self._conn() as conn:
