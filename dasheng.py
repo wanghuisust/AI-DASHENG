@@ -607,33 +607,54 @@ def setup():
             import cryptography
         except ImportError as e:
             echo_error(f"微信适配器依赖缺失: {e}")
-            echo_info("安装: pip install aiohttp cryptography")
-            echo_info("跳过微信扫码，可在安装依赖后重新运行 setup")
-            env["WECHAT_ENABLED"] = "false"
-            click.echo("")
-            click.echo("")
-        else:
-            # 检查是否已有有效凭证
-            from src.gateway.wechat_adapter import CredentialStore
-            cred_store = CredentialStore(str(PROJECT_DIR / "data"))
-            active_creds = cred_store.load_active()
+            echo_info("正在自动安装缺失依赖...")
+            subprocess.run(
+                [str(VENV_PYTHON), "-m", "pip", "install", "-q", "aiohttp", "cryptography"],
+                capture_output=True, timeout=120
+            )
+            # 重试导入
+            try:
+                import aiohttp
+                import cryptography
+            except ImportError as e2:
+                echo_error(f"依赖安装失败: {e2}")
+                echo_info("请手动安装: pip install aiohttp cryptography")
+                env["WECHAT_ENABLED"] = "false"
+                click.echo("")
+                click.echo("")
+                return  # 跳过微信配置
 
-            if active_creds:
-                echo_ok(f"已有微信凭证: account={active_creds.get('account_id', '')[:8]}...")
-                rebind = click.prompt("是否重新扫码绑定？(y/n)", type=str, default="n")
-                if rebind.lower() not in ("y", "yes"):
-                    # 保留现有凭证，写入 .env
-                    env["ILINK_BOT_TOKEN"] = active_creds.get("token", "")
-                    env["ILINK_ACCOUNT_ID"] = active_creds.get("account_id", "")
-                    echo_ok("保留现有微信绑定")
-                    click.echo("")
-                    click.echo("")
-                else:
-                    # 清除旧凭证，重新扫码
-                    _do_wechat_qr_login(env, cred_store)
+        # 确保 qrcode 可用（终端显示二维码）
+        try:
+            import qrcode as _test_qr
+        except ImportError:
+            echo_info("正在安装 qrcode（终端二维码显示需要）...")
+            subprocess.run(
+                [str(VENV_PYTHON), "-m", "pip", "install", "-q", "qrcode"],
+                capture_output=True, timeout=60
+            )
+
+        # 检查是否已有有效凭证
+        from src.gateway.wechat_adapter import CredentialStore
+        cred_store = CredentialStore(str(PROJECT_DIR / "data"))
+        active_creds = cred_store.load_active()
+
+        if active_creds:
+            echo_ok(f"已有微信凭证: account={active_creds.get('account_id', '')[:8]}...")
+            rebind = click.prompt("是否重新扫码绑定？(y/n)", type=str, default="n")
+            if rebind.lower() not in ("y", "yes"):
+                # 保留现有凭证，写入 .env
+                env["ILINK_BOT_TOKEN"] = active_creds.get("token", "")
+                env["ILINK_ACCOUNT_ID"] = active_creds.get("account_id", "")
+                echo_ok("保留现有微信绑定")
+                click.echo("")
+                click.echo("")
             else:
-                # 首次绑定 — 直接扫码
+                # 清除旧凭证，重新扫码
                 _do_wechat_qr_login(env, cred_store)
+        else:
+            # 首次绑定 — 直接扫码
+            _do_wechat_qr_login(env, cred_store)
     else:
         env["WECHAT_ENABLED"] = "false"
         echo_info("跳过微信配置")
