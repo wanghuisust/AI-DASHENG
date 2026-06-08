@@ -1,7 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-data/memory.json
 .env
 logs/
 *.egg-info/
@@ -9,15 +8,16 @@ dist/
 build/
 *.log
 *.db
+data/conversations.db
+data/memory.json
+data/.cache/
 src/llama.cpp/
 src/$null
 src/data/
 nul
 tmp_*.py
-.hermes/
-src/2025-01-01
-"!data/.cache/"  
 tmp_*.html
 tmp_*.txt
 tmp_*.cookie.txt
 check_ws.py
+.hermes/
