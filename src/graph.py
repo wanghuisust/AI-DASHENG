@@ -249,7 +249,17 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
             ]) or len(_content) >= 150  # 长回复大概率有实质内容
             _is_intent_only = not _has_substance
             
-            if _is_intent_only:
+            # ── 闲聊豁免：用户消息是简单问候/闲聊，不需要工具，跳过重试 ──
+            _chitchat_patterns = [
+                "在吗", "在不在", "你好", "嗨", "hi", "hello", "嘿",
+                "早上好", "晚上好", "早安", "晚安", "中午好",
+                "谢谢", "好的", "嗯嗯", "知道了", "收到", "ok",
+                "你是谁", "你叫什么", "你能做什么",
+            ]
+            _is_chitchat = (len(last_user_msg) < 30 and 
+                           any(p in last_user_msg.lower() for p in _chitchat_patterns))
+            
+            if _is_intent_only and not _is_chitchat:
                 print(f"[{_ts}] [EMPTY-INTENT] LLM回复太短且无实质内容: '{_content[:60]}'，重试", flush=True)
                 # 最多重试3次，逐步加强提示
                 _retry_prompts = [
