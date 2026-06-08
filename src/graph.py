@@ -438,8 +438,8 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
 
     # ── 检测2：同类重复 — 同工具名出现多次 ──
     # 关键改进：如果每次返回不同结果（在进步/探索），只打警告不杀；只有真正死循环才杀
-    SAME_TOOL_LIMIT = 8       # 同工具调 8 次以上才考虑（给足探索空间）
-    SAME_TOOL_HARD_LIMIT = 15 # 硬上限，无论如何超过就杀
+    SAME_TOOL_LIMIT = 8        # 同工具调 8 次以上才考虑（给足探索空间）
+    SAME_TOOL_HARD_LIMIT = 30  # 硬上限，与 Hermes max_iterations 对齐
 
     tool_name_counts = {}
     for tool_name, _ in recent_calls:

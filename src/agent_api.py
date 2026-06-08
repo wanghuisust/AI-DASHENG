@@ -687,6 +687,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                                             sse_send("status", {
                                                 "step": "tool_call",
                                                 "tool": tc["name"],
+                                                "args": tc.get("args", {}),
                                                 "message": f"正在调用 {tc['name']}...",
                                             })
                                 elif msg.content and isinstance(msg.content, str) and msg.content.strip():

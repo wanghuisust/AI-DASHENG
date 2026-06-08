@@ -180,9 +180,22 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                             short = content[:50] + ("..." if len(content) > 50 else "")
                             current_status["message"] = f"💭 推理中: {short}"
                         elif step == "tool_call":
-                            current_status["message"] = f"🔧 正在调用: {tool}"
+                            _args = data.get("args", {})
+                            _action = {
+                                "terminal_execute": "执行命令", "search_files": "搜索文件",
+                                "read_file": "读取文件", "write_file": "写入文件",
+                                "patch": "编辑文件", "web_search": "搜索网页",
+                            }.get(tool, tool)
+                            _preview = ""
+                            if _args:
+                                for k in ("command", "pattern", "path", "query", "text", "name"):
+                                    v = _args.get(k, "")
+                                    if isinstance(v, str) and v:
+                                        _preview = f"：\"{v[:30]}\""
+                                        break
+                            current_status["message"] = f"⚙️ {_action}{_preview}…"
                         elif step == "tool_done":
-                            current_status["message"] = f"✅ {tool} 执行完成\n▶️ 继续下一步…"
+                            current_status["message"] = f"▶️ 继续下一步…"
                         current_status["step"] = step
                     # 回调：实时推送进度给客户端
                     if on_status:
@@ -358,8 +371,57 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         _last_flush_time = [0.0]         # 上次发送时间
         _flush_timer = [None]            # 定时器
 
+        # ── 工具自然语言描述映射（Hermes 风格：半思考半行动）──
+        _TOOL_ACTION = {
+            "terminal_execute": "执行命令",
+            "search_files": "搜索文件",
+            "read_file": "读取文件",
+            "write_file": "写入文件",
+            "patch": "编辑文件",
+            "web_search": "搜索网页",
+            "web_extract": "提取网页内容",
+        }
+        _TOOL_EMOJI = {
+            "terminal_execute": "💻",
+            "search_files": "🔍",
+            "read_file": "📄",
+            "write_file": "✏️",
+            "patch": "✏️",
+            "web_search": "🌐",
+            "web_extract": "🌐",
+        }
+
+        def _tool_preview(tool: str, args: dict) -> str:
+            """从工具参数中提取预览文本（类似 Hermes build_tool_preview）"""
+            if not args:
+                return ""
+            if tool == "terminal_execute":
+                cmd = args.get("command", "")
+                return cmd[:40] if cmd else ""
+            if tool == "search_files":
+                pattern = args.get("pattern", "")
+                return pattern[:40] if pattern else ""
+            if tool == "read_file":
+                path = args.get("path", "")
+                return path[:50] if path else ""
+            if tool == "write_file":
+                path = args.get("path", "")
+                return path[:50] if path else ""
+            if tool == "patch":
+                path = args.get("path", "")
+                return path[:50] if path else ""
+            if tool == "web_search":
+                query = args.get("query", "")
+                return query[:40] if query else ""
+            # 通用：取第一个有值的字符串参数
+            for key in ("query", "text", "command", "path", "name", "prompt"):
+                val = args.get(key, "")
+                if isinstance(val, str) and val:
+                    return val[:40]
+            return ""
+
         def _flush_progress():
-            """合并发送积攒的步骤"""
+            """合并发送积攒的步骤——Hermes 风格：自然语言描述，半思考半行动"""
             if not _pending_steps:
                 return
             steps = _pending_steps.copy()
@@ -372,55 +434,42 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             for s in steps:
                 last = merged[-1] if merged else None
                 if last and last["type"] == s["type"] and last.get("tool") == s.get("tool"):
-                    # 同类合并：计数+1
                     last["count"] = last.get("count", 1) + 1
-                    # 保留最后一个的结果（如果有）
                     if s.get("result"):
                         last["result"] = s["result"]
                 else:
                     merged.append(s.copy())
 
             # ── 构造文本 ──
+            # Hermes 风格：tool_call 显示"正在做什么"（自然语言+preview），
+            # tool_done 不单独显示（已在 tool_call 中预告了动作），只在出错时提示
             lines = []
             for m in merged:
                 if m["type"] == "tool_call":
                     cnt = m.get("count", 1)
+                    tool = m.get("tool", "")
+                    args = m.get("args", {})
+                    action = _TOOL_ACTION.get(tool, tool)
+                    emoji = _TOOL_EMOJI.get(tool, "⚙️")
+                    preview = _tool_preview(tool, args)
                     if cnt > 1:
-                        lines.append(f"🔧 调用 {m['tool']}×{cnt}")
+                        if preview:
+                            lines.append(f"{emoji} {action}中 ×{cnt}：\"{preview}\"…")
+                        else:
+                            lines.append(f"{emoji} {action}中 ×{cnt}…")
                     else:
-                        lines.append(f"🔧 调用 {m['tool']}")
+                        if preview:
+                            lines.append(f"{emoji} {action}：\"{preview}\"…")
+                        else:
+                            lines.append(f"{emoji} {action}…")
                 elif m["type"] == "tool_done":
-                    cnt = m.get("count", 1)
+                    # 正常完成不显示（避免刷屏），只显示错误
                     result = m.get("result", "")
-                    # 摘要：只显示统计数，不显示具体文件名/路径（对用户无用，最终 result 会包含）
-                    summary = ""
-                    if result and len(result) > 5:
+                    is_error = result and any(kw in result[:200] for kw in ["[stderr]", "error", "Error", "不是内部或外部命令", "拒绝访问"])
+                    if is_error:
                         result_lines = [l for l in result.split("\n") if l.strip()]
-                        num_items = len(result_lines)
-                        # 检查是否有错误标志
-                        is_error = any(kw in result[:200] for kw in ["[stderr]", "error", "Error", "不是内部或外部命令", "拒绝访问"])
-                        if is_error:
-                            # 简述错误
-                            err_line = result_lines[0][:30] if result_lines else "执行出错"
-                            summary = f"⚠️ {err_line}"
-                        elif num_items > 1:
-                            # 多行结果，只报数量
-                            last_line = result_lines[-1].strip() if result_lines else ""
-                            if any(kw in last_line for kw in ["个文件", "个目录", "File(s)", "Dir(s)", "字节", "bytes"]):
-                                summary = last_line[:40]
-                            else:
-                                summary = f"{num_items} 项结果"
-                        # 单行结果不显示（太短没意义）
-                    if summary:
-                        if cnt > 1:
-                            lines.append(f"✅ {m['tool']}×{cnt} → {summary}")
-                        else:
-                            lines.append(f"✅ {m['tool']} → {summary}")
-                    else:
-                        if cnt > 1:
-                            lines.append(f"✅ {m['tool']}×{cnt} 完成")
-                        else:
-                            lines.append(f"✅ {m['tool']} 完成")
+                        err_line = result_lines[0][:30] if result_lines else "执行出错"
+                        lines.append(f"⚠️ {err_line}")
                 elif m["type"] == "thinking":
                     lines.append(f"💭 {m.get('text', '')[:80]}")
 
@@ -464,7 +513,7 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
 
             # ── 构造步骤条目 ──
             if step == "tool_call":
-                _pending_steps.append({"type": "tool_call", "tool": tool})
+                _pending_steps.append({"type": "tool_call", "tool": tool, "args": data.get("args", {})})
             elif step == "tool_done":
                 # 工具结果，取前500字用于智能摘要（不能只取100字，否则行数统计不准）
                 tool_content = data.get("content", "") or data.get("message", "")
