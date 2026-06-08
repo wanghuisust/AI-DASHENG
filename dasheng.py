@@ -453,18 +453,21 @@ def setup():
     # 选择提供商
     providers = {
         "1": ("OpenAI 官方", "https://api.openai.com/v1", "gpt-4o-mini"),
-        "2": ("Qwen / 通义千问（阿里云）", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-        "3": ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
-        "4": ("智谱 GLM（ChatGLM）", "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
-        "5": ("月之暗面 Moonshot", "https://api.moonshot.cn/v1", "moonshot-v1-8k"),
-        "6": ("硅基流动 SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-7B-Instruct"),
-        "7": ("Agnes AI", "https://apihub.agnes-ai.com/v1", "agnes-2.0-flash"),
-        "8": ("自定义", "", ""),
+        "2": ("Claude / Anthropic", "https://api.anthropic.com/v1", "claude-sonnet-4-20250514"),
+        "3": ("Qwen / 通义千问（阿里云）", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+        "4": ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
+        "5": ("智谱 GLM（ChatGLM）", "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+        "6": ("月之暗面 Moonshot", "https://api.moonshot.cn/v1", "moonshot-v1-8k"),
+        "7": ("小米 MiLM", "https://api.milongdexiangce.com/v1", "MiLM-6B"),
+        "8": ("硅基流动 SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-7B-Instruct"),
+        "9": ("Agnes AI", "https://apihub.agnes-ai.com/v1", "agnes-2.0-flash"),
+        "10": ("自定义", "", ""),
     }
 
     click.echo("请选择 LLM 提供商:")
     for k, (name, _, _) in providers.items():
         click.echo(f"  {k}. {name}")
+    click.echo("  0. 跳过（稍后在 .env 文件中手动配置）")
 
     current_provider_hint = ""
     current_base_url = env.get("OPENAI_BASE_URL", "")
@@ -479,62 +482,77 @@ def setup():
         type=str, default="1"
     )
 
-    if choice in providers and choice != "8":
+    # 跳过 LLM 配置
+    if choice == "0":
+        echo_warn("已跳过 LLM 配置")
+        echo_info("稍后可在项目根目录的 .env 文件中配置以下项：")
+        click.echo("  OPENAI_API_KEY=你的API密钥")
+        click.echo("  OPENAI_BASE_URL=https://api.openai.com/v1")
+        click.echo("  MODEL_NAME=gpt-4o-mini")
+        click.echo("  MODEL_CONTEXT_LENGTH=128000")
+        # 保留已有配置不覆盖
+        for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL_NAME", "MODEL_CONTEXT_LENGTH"]:
+            if key not in env:
+                env[key] = ""
+    elif choice in providers and choice != "10":
         _, default_url, default_model = providers[choice]
     else:
         default_url = ""
         default_model = ""
 
-    # API Key
-    current_key = env.get("OPENAI_API_KEY", "")
-    key_hint = f" (当前: {current_key[:8]}...)" if current_key else ""
-    api_key = click.prompt(
-        f"请输入 API Key{key_hint}",
-        type=str, default=current_key or "", show_default=False
-    )
-    if not api_key:
-        echo_warn("未设置 API Key，LLM 调用将失败")
-    env["OPENAI_API_KEY"] = api_key
-
-    # Base URL
-    base_url = click.prompt(
-        "请输入 API Base URL",
-        type=str, default=current_base_url or default_url or "https://api.openai.com/v1"
-    )
-    env["OPENAI_BASE_URL"] = base_url
-
-    # Model
-    current_model = env.get("MODEL_NAME", "")
-    model = click.prompt(
-        "请输入模型名称",
-        type=str, default=current_model or default_model or "gpt-4o-mini"
-    )
-    env["MODEL_NAME"] = model
-
-    # 上下文长度：自定义模型必须设置，内置模型有默认值
-    context_defaults = {
-        "1": 128000,   # OpenAI gpt-4o-mini
-        "2": 131072,   # Qwen qwen-plus
-        "3": 65536,    # DeepSeek
-        "4": 128000,   # GLM-4
-        "5": 8192,     # Moonshot v1-8k
-        "6": 32768,    # SiliconFlow
-        "7": 128000,   # Agnes
-    }
-    current_ctx = env.get("MODEL_CONTEXT_LENGTH", "")
-    if choice == "8":
-        # 自定义：必须输入
-        ctx_len = click.prompt(
-            "请输入模型上下文长度（token 数）",
-            type=int, default=int(current_ctx) if current_ctx else 32768
+    if choice != "0":
+        # API Key
+        current_key = env.get("OPENAI_API_KEY", "")
+        key_hint = f" (当前: {current_key[:8]}...)" if current_key else ""
+        api_key = click.prompt(
+            f"请输入 API Key{key_hint}",
+            type=str, default=current_key or "", show_default=False
         )
-    else:
-        ctx_len = context_defaults.get(choice, 32768)
-        if current_ctx:
-            ctx_len = int(current_ctx)
-    env["MODEL_CONTEXT_LENGTH"] = str(ctx_len)
+        if not api_key:
+            echo_warn("未设置 API Key，LLM 调用将失败")
+        env["OPENAI_API_KEY"] = api_key
 
-    echo_ok(f"LLM 配置: {model} @ {base_url} (上下文: {ctx_len} tokens, 压缩阈值: {ctx_len // 2})")
+        # Base URL
+        base_url = click.prompt(
+            "请输入 API Base URL",
+            type=str, default=current_base_url or default_url or "https://api.openai.com/v1"
+        )
+        env["OPENAI_BASE_URL"] = base_url
+
+        # Model
+        current_model = env.get("MODEL_NAME", "")
+        model = click.prompt(
+            "请输入模型名称",
+            type=str, default=current_model or default_model or "gpt-4o-mini"
+        )
+        env["MODEL_NAME"] = model
+
+        # 上下文长度：自定义模型必须设置，内置模型有默认值
+        context_defaults = {
+            "1": 128000,   # OpenAI gpt-4o-mini
+            "2": 200000,   # Claude
+            "3": 131072,   # Qwen qwen-plus
+            "4": 65536,    # DeepSeek
+            "5": 128000,   # GLM-4
+            "6": 8192,     # Moonshot v1-8k
+            "7": 32768,    # 小米 MiLM
+            "8": 32768,    # SiliconFlow
+            "9": 128000,   # Agnes
+        }
+        current_ctx = env.get("MODEL_CONTEXT_LENGTH", "")
+        if choice == "10":
+            # 自定义：必须输入
+            ctx_len = click.prompt(
+                "请输入模型上下文长度（token 数）",
+                type=int, default=int(current_ctx) if current_ctx else 32768
+            )
+        else:
+            ctx_len = context_defaults.get(choice, 32768)
+            if current_ctx:
+                ctx_len = int(current_ctx)
+        env["MODEL_CONTEXT_LENGTH"] = str(ctx_len)
+
+        echo_ok(f"LLM 配置: {model} @ {base_url} (上下文: {ctx_len} tokens, 压缩阈值: {ctx_len // 2})")
 
     # ── 2. QQ Bot 配置 ───────────────────────────────────────────────────
     click.echo("")
