@@ -4,12 +4,12 @@ from langchain_core.tools import tool
 
 
 @tool
-def terminal_execute(command: str, timeout: int = 60) -> str:
+def terminal_execute(command: str, timeout: int = 180) -> str:
     """在本地终端执行 shell 命令并返回输出。
 
     Args:
         command: 要执行的 shell 命令
-        timeout: 超时秒数，默认60
+        timeout: 超时秒数，默认180（与 Hermes 对齐）
 
     Returns:
         命令的标准输出和标准错误

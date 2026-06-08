@@ -61,8 +61,8 @@ def create_llm(model: str = None, base_url: str = None, api_key: str = None):
         base_url=_base_url,
         api_key=_api_key,
         temperature=0.3,
-        # 单次 LLM 调用超时 60 秒（Agnes 免费版较慢）
-        request_timeout=60,
+        # 单次 LLM 调用超时 300 秒（与 Hermes 的 1800s 对齐，小模型适当缩短）
+        request_timeout=300,
         # 遇到 429 rate limit 自动重试，最多 5 次，指数退避
         max_retries=5,
     )
