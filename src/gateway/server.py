@@ -113,8 +113,10 @@ def _call_agent_sync(message: PlatformMessage) -> str:
         return f"抱歉，处理消息时出错"
 
 
-def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock) -> str:
-    """调用 Agent 流式接口（SSE），实时更新 current_status"""
+def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock, cancel_event: threading.Event = None) -> str:
+    """调用 Agent 流式接口（SSE），实时更新 current_status
+    cancel_event: 如果被 set，中止 SSE 读取
+    """
     url = f"{DASHENG_API}/v1/chat/stream"
     payload = json.dumps({
         "message": message.text,
@@ -129,9 +131,22 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
 
     try:
         resp = urllib.request.urlopen(req, timeout=1800)
+        # 记录 resp 到 active_requests，以便取消时关闭
+        with _active_requests_lock:
+            entry = _active_requests.get(message.chat_id)
+            if entry:
+                entry["sse_resp"] = resp
         response_text = ""
         logger.debug(f"[SSE] Connected to {url}, reading events...")
         for line_bytes in resp:
+            # 检查是否被取消
+            if cancel_event and cancel_event.is_set():
+                logger.info(f"[SSE] 请求被取消，停止读取 (chat_id={message.chat_id})")
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return ""
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -166,7 +181,7 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                         elif step == "tool_call":
                             current_status["message"] = f"🔧 正在调用: {tool}"
                         elif step == "tool_done":
-                            current_status["message"] = f"✅ {tool} 执行完成"
+                            current_status["message"] = f"✅ {tool} 执行完成\n▶️ 继续下一步…"
                         current_status["step"] = step
                 elif event_type == "result":
                     response_text = data.get("response", "")
@@ -190,25 +205,87 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
 
 
 # ── 消息处理 ─────────────────────────────────────────────────────────────────
+# ── 消息处理 ─────────────────────────────────────────────────────────────────
+
+# 按 chat_id 跟踪正在处理的请求，用于取消旧请求
+_active_requests = {}        # chat_id → {"thread": Thread, "cancel_event": Event, "sse_resp": ...}
+_active_requests_lock = threading.Lock()
+
+
+def _cancel_active_request(chat_id: str, platform: str = "", is_group: bool = False, user_id: str = "") -> bool:
+    """取消同一 chat_id 的正在处理的请求，返回是否有请求被取消"""
+    with _active_requests_lock:
+        entry = _active_requests.get(chat_id)
+        if not entry:
+            return False
+        logger.info(f"[{chat_id}] 取消前一个正在处理的请求")
+        entry["cancel_event"].set()  # 通知 SSE 读取线程停止
+        # 关闭 SSE 连接
+        if entry.get("sse_resp"):
+            try:
+                entry["sse_resp"].close()
+            except Exception:
+                pass
+        # 通知 Agent API 取消
+        try:
+            cancel_url = f"{DASHENG_API}/v1/chat/cancel"
+            payload = json.dumps({"thread_id": chat_id}).encode("utf-8")
+            req = urllib.request.Request(cancel_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # Agent API 取消失败不阻塞
+
+        # 给客户端发"正在取消任务…"通知
+        if platform == "qq":
+            cancel_reply = PlatformReply(
+                platform=platform,
+                chat_id=chat_id,
+                text="⏳ 正在取消任务…",
+                is_group=is_group,
+                at_user=user_id,
+            )
+            try:
+                qq_adapter.send_reply(cancel_reply)
+            except Exception:
+                pass
+        return True
+
 
 def handle_message(message: PlatformMessage):
     """统一消息处理入口 — 异步处理，不阻塞 WebSocket 事件循环"""
     logger.info(f"[{message.platform}] {message.user_id}@{message.chat_id}: {message.text[:80]}")
+
+    # 取消同一 chat_id 的前一个请求
+    had_active = _cancel_active_request(
+        message.chat_id, message.platform, message.is_group, message.user_id
+    )
+
     # 在新线程中处理，避免阻塞 QQ 心跳/事件循环
-    threading.Thread(target=_process_and_reply, args=(message,), daemon=True).start()
+    cancel_event = threading.Event()
+    t = threading.Thread(target=_process_and_reply, args=(message, cancel_event), daemon=True)
+    with _active_requests_lock:
+        _active_requests[message.chat_id] = {"thread": t, "cancel_event": cancel_event}
+    t.start()
 
 
-def _process_and_reply(message: PlatformMessage):
-    """实际处理：调用 Agent 流式接口，每30s推送当前步骤状态到 QQ"""
+def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
+    """实际处理：调用 Agent 流式接口，每60s推送当前步骤状态到 QQ
+    cancel_event: 如果被 set，表示有新请求到来，应取消当前请求
+    """
+    chat_id = message.chat_id
     try:
         progress_stop = threading.Event()
         current_status = {"step": "thinking", "message": "正在思考..."}
         status_lock = threading.Lock()
 
+        # ── 发送开始处理通知（如果取消了前一个，_cancel_active_request 已发过通知） ──
+
         def _send_progress():
             """每60s发一次进度消息，附带当前步骤状态"""
             count = 0
             while not progress_stop.wait(60):
+                if cancel_event.is_set():
+                    return  # 新请求到来，停止进度
                 count += 1
                 with status_lock:
                     step_text = current_status.get("message", "")
@@ -233,12 +310,17 @@ def _process_and_reply(message: PlatformMessage):
 
         # ── 调用 Agent 流式接口 ──
         logger.info(f"[{message.platform}] 开始调用 Agent（流式）...")
-        reply_text = _call_agent_stream(message, current_status, status_lock)
+        reply_text = _call_agent_stream(message, current_status, status_lock, cancel_event)
 
         # ── 停止进度消息 ──
         if progress_thread:
             progress_stop.set()
             progress_thread.join(timeout=3)
+
+        # ── 如果被取消，不发回复（新请求会自己发） ──
+        if cancel_event.is_set():
+            logger.info(f"[{chat_id}] 请求被新请求取消，跳过回复")
+            return
 
         if not reply_text:
             logger.warning(f"[{message.platform}] Agent 返回空回复")
@@ -263,6 +345,12 @@ def _process_and_reply(message: PlatformMessage):
             logger.warning(f"未知平台: {message.platform}")
     except Exception as e:
         logger.error(f"[{message.platform}] 处理消息异常: {e}", exc_info=True)
+    finally:
+        # 清理 active_requests
+        with _active_requests_lock:
+            entry = _active_requests.get(chat_id)
+            if entry and entry.get("thread") is threading.current_thread():
+                _active_requests.pop(chat_id, None)
 
 
 # ── HTTP Handler (QQ 上报备选 + 健康检查) ─────────────────────────────────────

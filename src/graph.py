@@ -18,6 +18,7 @@
 """
 
 import os
+import threading
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
@@ -97,9 +98,67 @@ _memory = Memory()
 _skill_manager = SkillManager(os.path.join(os.path.dirname(__file__), "..", "data", "skills"))
 
 
-def agent_node(state: AgentState, llm) -> dict:
-    """LLM 思考节点：决定下一步是调用工具还是回复用户"""
+def _detect_stuck_loop(messages: list) -> list:
+    """检测并清理 AI 死循环：连续多条 AI 回复都说'无法连接/失败'但没有 tool_calls
+    保留第一条和最后一条，中间的替换为一条摘要
+    """
+    STUCK_KEYWORDS = ["无法连接", "暂时无法", "连接失败", "搜索失败", "网络异常", "无法访问"]
+    
+    # 找出连续的"卡住"AI消息（无tool_calls + 包含失败关键词）
+    stuck_ranges = []  # [(start_idx, end_idx), ...]
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if (hasattr(msg, 'type') and msg.type == 'ai' 
+            and not (hasattr(msg, 'tool_calls') and msg.tool_calls)
+            and msg.content):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if any(kw in content for kw in STUCK_KEYWORDS):
+                start = i
+                while i < len(messages):
+                    m = messages[i]
+                    if (hasattr(m, 'type') and m.type == 'ai' 
+                        and not (hasattr(m, 'tool_calls') and m.tool_calls)
+                        and m.content):
+                        c = m.content if isinstance(m.content, str) else str(m.content)
+                        if any(kw in c for kw in STUCK_KEYWORDS):
+                            i += 1
+                            continue
+                    break
+                end = i  # exclusive
+                if end - start >= 2:
+                    stuck_ranges.append((start, end))
+                continue
+        i += 1
+    
+    if not stuck_ranges:
+        return messages
+    
+    # 合并每个stuck范围：保留第一条，删掉中间的，保留最后一条
+    result = list(messages)
+    for start, end in reversed(stuck_ranges):
+        if end - start > 2:
+            # 保留第一条和最后一条，中间替换为一条摘要
+            from langchain_core.messages import AIMessage
+            summary_msg = AIMessage(content="[之前多次尝试搜索均失败，已省略中间重复记录]")
+            result[start+1:end-1] = [summary_msg]
+    
+    print(f"[LOOP-CLEAN] 检测到 {len(stuck_ranges)} 处死循环，已清理", flush=True)
+    return result
+
+
+def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> dict:
+    """LLM 思考节点：决定下一步是调用工具还是回复用户
+    cancel_event: 外部传入的取消信号，如果被 set 则立即返回
+    """
     messages = state["messages"]
+
+    # 0. 检查是否已被取消
+    if cancel_event and cancel_event.is_set():
+        return {"messages": [AIMessage(content="(请求已取消)")]}
+
+    # 0.5 清理死循环历史（连续多条"搜索失败"的AI消息）
+    messages = _detect_stuck_loop(messages)
 
     # 1. 上下文压缩：对话太长时自动摘要旧消息
     messages = compress_messages(messages, llm=None)  # 不用 LLM 摘要，用简单截断（省token）
@@ -143,12 +202,76 @@ def agent_node(state: AgentState, llm) -> dict:
             _tc = f' tool_call_id={_tcid}'
         print(f"[{_ts}] [LLM]   msg[{_i}] {_role}: {_content}{_tc}", flush=True)
     try:
-        response = llm.invoke(full_messages)
+        # 用线程+超时包装 llm.invoke，以便在等待 LLM 响应期间检测 cancel
+        _invoke_result = [None]
+        _invoke_error = [None]
+
+        def _do_invoke():
+            try:
+                _invoke_result[0] = llm.invoke(full_messages)
+            except Exception as e:
+                _invoke_error[0] = e
+
+        _invoke_thread = threading.Thread(target=_do_invoke, daemon=True)
+        _invoke_thread.start()
+
+        # 每2秒检查一次 cancel，同时等 invoke 完成
+        while _invoke_thread.is_alive():
+            if cancel_event and cancel_event.is_set():
+                print(f"[{_ts}] [LLM] invoke CANCELLED by cancel_event", flush=True)
+                return {"messages": [AIMessage(content="(请求已取消)")]}
+            _invoke_thread.join(timeout=2)
+
+        if _invoke_error[0]:
+            raise _invoke_error[0]
+
+        response = _invoke_result[0]
         _resp_chars = len(str(response.content)) if response.content else 0
         _resp_tc = ''
         if hasattr(response, 'tool_calls') and response.tool_calls:
             _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
         print(f"[{_ts}] [LLM] invoke OK: {_resp_chars} chars{_resp_tc}", flush=True)
+        
+        # ── 空意图重试：LLM 说要调工具但没生成 tool_calls ──
+        if not (hasattr(response, 'tool_calls') and response.tool_calls) and response.content:
+            _content = response.content if isinstance(response.content, str) else str(response.content)
+            # 检测"让我...通过/查询/调用"这种空意图模式
+            import re
+            INTENT_PATTERNS = [
+                r"让我.{0,6}(通过|用|调用|查询|搜索|来|使用|尝试|抓取|获取|看看|帮你|为您)",
+                r"我来.{0,4}(查询|搜索|调用|使用|试试|看看|帮你)",
+                r"我将.{0,4}(使用|调用|通过|尝试)",
+                r"我(帮|为)你.{0,4}(查|搜|看|找|获取)",
+            ]
+            _has_intent = any(re.search(p, _content) for p in INTENT_PATTERNS)
+            if _has_intent:
+                print(f"[{_ts}] [EMPTY-INTENT] LLM说要用工具但没生成tool_calls，重试一次", flush=True)
+                # 追加AI回复 + 提示HumanMessage，让LLM真正调工具
+                retry_messages = full_messages + [response, HumanMessage(
+                    content="[系统提示：你刚才说了要用工具但没有生成tool_call。请直接调用对应的工具函数，不要只说'让我查询'。如果工具不可用，就直接告诉用户。]"
+                )]
+                _retry_result = [None]
+                _retry_error = [None]
+                def _do_retry():
+                    try:
+                        _retry_result[0] = llm.invoke(retry_messages)
+                    except Exception as e:
+                        _retry_error[0] = e
+                _retry_thread = threading.Thread(target=_do_retry, daemon=True)
+                _retry_thread.start()
+                while _retry_thread.is_alive():
+                    if cancel_event and cancel_event.is_set():
+                        return {"messages": [AIMessage(content="(请求已取消)")]}
+                    _retry_thread.join(timeout=2)
+                if _retry_error[0]:
+                    print(f"[{_ts}] [EMPTY-INTENT] 重试失败: {str(_retry_error[0])[:200]}", flush=True)
+                elif _retry_result[0]:
+                    response = _retry_result[0]
+                    _resp_chars = len(str(response.content)) if response.content else 0
+                    _resp_tc = ''
+                    if hasattr(response, 'tool_calls') and response.tool_calls:
+                        _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
+                    print(f"[{_ts}] [EMPTY-INTENT] 重试OK: {_resp_chars} chars{_resp_tc}", flush=True)
     except Exception as e:
         import traceback as _tb
         _error_full = str(e)
@@ -176,15 +299,17 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
 
 # ── 构建图 ──────────────────────────────────────────────────
 
-def build_graph(llm=None):
-    """构建 Agent 图"""
+def build_graph(llm=None, cancel_event: threading.Event = None):
+    """构建 Agent 图
+    cancel_event: 传入取消信号，LLM invoke 等待期间可被中断
+    """
     if llm is None:
         llm = create_llm()
 
     tool_node = ToolNode(ALL_TOOLS)
 
     graph = StateGraph(AgentState)
-    graph.add_node("agent", lambda state: agent_node(state, llm))
+    graph.add_node("agent", lambda state: agent_node(state, llm, cancel_event))
     graph.add_node("tools", tool_node)
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})

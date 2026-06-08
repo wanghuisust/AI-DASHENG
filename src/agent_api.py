@@ -37,6 +37,11 @@ from graph import build_graph
 from persistence import get_store
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
+# ── 请求取消机制 ──────────────────────────────────────────────
+# thread_id → Event：当 set 时，对应的流式请求应停止
+_cancel_events = {}
+_cancel_lock = threading.Lock()
+
 # ── 全局 Agent ──────────────────────────────────────────────
 
 print("Loading AI-DASHENG Agent...")
@@ -241,6 +246,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         # POST /v1/chat — 同步
         elif parsed.path == "/v1/chat":
             self._handle_sync_chat()
+        # POST /v1/chat/cancel — 取消正在处理的请求
+        elif parsed.path == "/v1/chat/cancel":
+            self._handle_cancel()
         # POST /v1/threads — 创建会话
         elif parsed.path == "/v1/threads":
             self._handle_create_thread()
@@ -265,6 +273,28 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "ok", "deleted": tid})
         else:
             self.send_error(404)
+
+    # ── 取消请求 ─────────────────────────────────────────────
+
+    def _handle_cancel(self):
+        """POST /v1/chat/cancel — 取消指定 thread_id 的正在处理的请求"""
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            data = json.loads(body) if body else {}
+            thread_id = data.get("thread_id", "")
+            if not thread_id:
+                self.send_json({"status": "error", "message": "thread_id required"}, 400)
+                return
+            with _cancel_lock:
+                evt = _cancel_events.get(thread_id)
+                if evt:
+                    evt.set()
+                    del _cancel_events[thread_id]
+                    self.send_json({"status": "cancelled", "thread_id": thread_id})
+                else:
+                    self.send_json({"status": "not_found", "thread_id": thread_id})
+        except Exception as e:
+            self.send_json({"status": "error", "message": str(e)}, 500)
 
     # ── 状态 ─────────────────────────────────────────────
 
@@ -427,6 +457,14 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         _ka_thread.start()
 
         try:
+            # 注册 cancel_event，以便外部取消此请求
+            _local_cancel = threading.Event()
+            with _cancel_lock:
+                old_evt = _cancel_events.get(thread_id)
+                if old_evt:
+                    old_evt.set()  # 取消旧请求
+                _cancel_events[thread_id] = _local_cancel
+
             if not acquire_thread_lock(thread_id, timeout=1800):
                 sse_send("error", {"message": "当前会话正在处理中，请稍后再试"})
                 self.close_connection = True
@@ -444,44 +482,81 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 all_new_messages = []
                 tool_calls_seen = set()
 
-                # 用线程+超时保护 graph.stream，防止 LLM API 卡住
-                _stream_result = []
+                # 用队列+线程 流式处理，边产边消费，不堆积全部 event 在内存
+                import queue
+                _event_queue = queue.Queue(maxsize=32)  # 限制队列大小，backpressure
                 _stream_error = [None]
+                _stream_done = [False]
+
+                # 每次请求构建带 cancel_event 的 graph 实例，以便 LLM invoke 期间可被取消
+                _cancelable_graph = build_graph(cancel_event=_local_cancel)
 
                 def _run_stream():
                     try:
-                        for event in graph.stream(
+                        _step = 0
+                        for event in _cancelable_graph.stream(
                             {"messages": messages},
                             config={"recursion_limit": 128},
                         ):
-                            if _stream_result is None:  # 被超时终止
+                            _step += 1
+                            _nodes = list(event.keys())
+                            print(f"[STREAM-EVENT] step={_step} nodes={_nodes}", flush=True)
+                            for _nk, _nv in event.items():
+                                if _nk == "agent":
+                                    _msgs = _nv.get("messages", [])
+                                    for _m in _msgs:
+                                        _tc = ""
+                                        if hasattr(_m, "tool_calls") and _m.tool_calls:
+                                            _tc = f" tool_calls=[{', '.join(tc['name'] for tc in _m.tool_calls)}]"
+                                        _c = str(_m.content)[:80] if _m.content else "(empty)"
+                                        print(f"  [STREAM-EVENT] agent: type={_m.type} content={_c}{_tc}", flush=True)
+                                elif _nk == "tools":
+                                    _msgs = _nv.get("messages", [])
+                                    for _m in _msgs:
+                                        _c = str(_m.content)[:80] if _m.content else "(empty)"
+                                        print(f"  [STREAM-EVENT] tools: type={_m.type} content={_c}", flush=True)
+                            if _stream_done[0] or _local_cancel.is_set():  # 被超时/取消终止
                                 break
-                            _stream_result.append(event)
+                            _event_queue.put(event, timeout=1800)
                     except Exception as e:
+                        print(f"[STREAM-EVENT] ERROR: {type(e).__name__}: {str(e)[:300]}", flush=True)
                         _stream_error[0] = e
+                    finally:
+                        print(f"[STREAM-EVENT] DONE, total_steps={_step}", flush=True)
+                        _event_queue.put(None)  # sentinel
 
                 _st = threading.Thread(target=_run_stream, daemon=True)
                 _st.start()
-                # 等待 graph.stream 完成，最多 1800 秒
-                _st.join(timeout=1800)
 
-                if _st.is_alive():
-                    # 超时了，终止线程
-                    _stream_result = None
-                    _st.join(timeout=5)
-                    sse_send("error", {"message": "处理超时，请稍后重试"})
-                    self.close_connection = True
-                    return
-                if _stream_error[0]:
-                    raise _stream_error[0]
+                # 消费 event 队列，边收边处理，不堆积
+                timeout_seconds = 1800
+                while True:
+                    # 检查是否被取消
+                    if _local_cancel.is_set():
+                        _stream_done[0] = True
+                        logger.info(f"[STREAM] 请求被取消 thread={thread_id}")
+                        sse_send("status", {"step": "cancelled", "message": "请求已取消"})
+                        break
+                    try:
+                        event = _event_queue.get(timeout=5)  # 短轮询，快速响应 cancel
+                    except queue.Empty:
+                        timeout_seconds -= 5
+                        if timeout_seconds <= 0:
+                            # 总超时 1800s
+                            _stream_done[0] = True
+                            sse_send("error", {"message": "处理超时，请稍后重试"})
+                            self.close_connection = True
+                            return
+                        continue  # 未超时，继续轮询
 
-                for event in _stream_result:
+                    if event is None:  # sentinel — 流结束
+                        break
+
                     for node_name, node_output in event.items():
                         if node_name == "agent":
                             msgs = node_output.get("messages", [])
                             for msg in msgs:
                                 all_new_messages.append(msg)
-                                # 如果有推理/思考内容，发 reasoning 事件
                                 if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
                                     reasoning = msg.additional_kwargs.get("reasoning_content", "") or \
                                                 msg.additional_kwargs.get("reasoning", "")
@@ -511,6 +586,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                                     "message": f"{tool_name} 执行完成",
                                 })
 
+                if _stream_error[0]:
+                    raise _stream_error[0]
+
                 result_messages = messages + all_new_messages
                 thread_messages[thread_id] = result_messages
                 save_ai_messages(thread_id, result_messages[prev_count:])
@@ -529,6 +607,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
             sse_send("error", {"message": str(e)})
         finally:
             _stop_keepalive.set()
+            # 清理 cancel_event
+            with _cancel_lock:
+                _cancel_events.pop(thread_id, None)
 
     # ── 创建会话 ─────────────────────────────────────────
 
@@ -577,9 +658,18 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 def main():
     host = "127.0.0.1"
     port = int(os.getenv("AGENT_API_PORT", "8900"))
+
+    # 提高连接和内存上限
+    import socket
+    ThreadingHTTPServer.request_queue_size = 64  # TCP backlog
+    ThreadingHTTPServer.timeout = 1800  # socket timeout 30min（匹配长任务）
+    ThreadingHTTPServer.allow_reuse_address = True
+
     server = ThreadingHTTPServer((host, port), AgentAPIHandler)
 
-    # 日志
+    # 启动时预分配线程池，避免无限制创建线程
+    from threading import Thread
+    server.daemon_threads = True  # 主进程退出时子线程自动退出
     log_path = Path(__file__).resolve().parent.parent / "agent_api.log"
     log_f = open(log_path, "a", encoding="utf-8", buffering=1)
     log_f.write(f"\n=== Agent API started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")

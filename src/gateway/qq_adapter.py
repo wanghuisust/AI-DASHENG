@@ -681,39 +681,60 @@ class QQBotAdapter:
     # ── 发送回复 ─────────────────────────────────────────────────────────
 
     def send_reply(self, reply) -> str:
-        """Gateway 统一接口 — 发送 PlatformReply，返回 msg_id（空字符串=失败）"""
+        """Gateway 统一接口 — 发送 PlatformReply，返回 msg_id（空字符串=失败）
+        最终回复(msg_type=2 Markdown) / 进度通知(msg_type=0 纯文本)
+        """
         from .models import PlatformReply
 
         if not self._token_mgr:
             return ""
 
+        # 统一使用纯文本 (msg_type=0)，避免 Markdown 400 错误导致消息发送失败
+        msg_type = 0
+        text = reply.text
+
         if reply.is_group:
             group_openid = reply.chat_id.replace("qq_group_", "")
-            return self._send_group_msg(group_openid, reply.text)
+            return self._send_group_msg(group_openid, text, msg_type=msg_type)
         else:
             user_openid = reply.chat_id.replace("qq_c2c_", "")
-            return self._send_c2c_msg(user_openid, reply.text)
+            return self._send_c2c_msg(user_openid, text, msg_type=msg_type)
 
-    def _send_c2c_msg(self, openid: str, text: str) -> str:
+    def _send_c2c_msg(self, openid: str, text: str, msg_type: int = 0) -> str:
         """POST /v2/users/{openid}/messages → 返回 msg_id 或空字符串"""
         url = f"{self._token_mgr.api_base}/v2/users/{openid}/messages"
-        return self._post_message(url, text, msg_type=0, msg_seq=int(time.time()) % 2147483647)
+        return self._post_message(url, text, msg_type=msg_type, msg_seq=int(time.time()) % 2147483647)
 
-    def _send_group_msg(self, group_openid: str, text: str) -> str:
+    def _send_group_msg(self, group_openid: str, text: str, msg_type: int = 0) -> str:
         """POST /v2/groups/{group_openid}/messages → 返回 msg_id 或空字符串"""
         url = f"{self._token_mgr.api_base}/v2/groups/{group_openid}/messages"
-        return self._post_message(url, text, msg_type=0, msg_seq=int(time.time()) % 2147483647)
+        return self._post_message(url, text, msg_type=msg_type, msg_seq=int(time.time()) % 2147483647)
 
     def _post_message(self, url: str, text: str, msg_type: int = 0, msg_seq: int = 1) -> str:
-        """发送消息 HTTP 请求 → 返回 msg_id（空字符串表示失败）"""
+        """发送消息 HTTP 请求 → 返回 msg_id（空字符串表示失败）
+        msg_type=0: 纯文本, msg_type=2: Markdown
+        """
         headers = self._token_mgr.auth_header()
         headers["Content-Type"] = "application/json"
 
-        payload = json.dumps({
-            "content": text,
-            "msg_type": msg_type,
-            "msg_seq": msg_seq,
-        }).encode("utf-8")
+        if msg_type == 2:
+            # Markdown 消息：自定义内容模式（2026/4 已开放，无需模板审批）
+            md_text = _format_markdown(text)
+            payload = json.dumps({
+                "content": md_text,
+                "msg_type": 2,
+                "markdown": {
+                    "custom_template_id": "1",
+                    "content": md_text,
+                },
+                "msg_seq": msg_seq,
+            }).encode("utf-8")
+        else:
+            payload = json.dumps({
+                "content": text,
+                "msg_type": 0,
+                "msg_seq": msg_seq,
+            }).encode("utf-8")
 
         req = urllib.request.Request(
             url, data=payload, headers=headers, method="POST",
@@ -725,19 +746,30 @@ class QQBotAdapter:
                 # 成功返回消息 ID
                 msg_id = result.get("id", "")
                 if msg_id:
-                    logger.info(f"QQ: 消息发送成功 id={msg_id}")
+                    logger.info(f"QQ: 消息发送成功 id={msg_id} (msg_type={msg_type})")
                     return msg_id
                 # 检查错误码
                 code = result.get("code", -1)
                 if code == 0:
                     return ""
+                # Markdown 发送失败 → fallback 纯文本
+                if msg_type == 2:
+                    logger.warning(f"QQ: Markdown 发送失败(code={code})，降级为纯文本: {result}")
+                    return self._post_message(url, text, msg_type=0, msg_seq=msg_seq)
                 logger.error(f"QQ: 消息发送失败: {result}")
                 return ""
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
+            # Markdown 发送 HTTP 错误 → fallback 纯文本
+            if msg_type == 2:
+                logger.warning(f"QQ: Markdown HTTP 错误 {e.code}，降级为纯文本: {body[:200]}")
+                return self._post_message(url, text, msg_type=0, msg_seq=msg_seq)
             logger.error(f"QQ: 消息发送 HTTP 错误 {e.code}: {body}")
             return ""
         except Exception as e:
+            if msg_type == 2:
+                logger.warning(f"QQ: Markdown 发送异常，降级为纯文本: {e}")
+                return self._post_message(url, text, msg_type=0, msg_seq=msg_seq)
             logger.error(f"QQ: 消息发送失败: {e}")
             return ""
 
@@ -788,6 +820,65 @@ class QQBotAdapter:
             self._ws_thread.join(timeout=3)
         self._ws = None
         self._ws_thread = None
+
+
+# ── Markdown 格式化 ──────────────────────────────────────────────────────────
+
+import re as _re
+
+def _format_markdown(text: str) -> str:
+    """将 Agent 纯文本回复转为 QQ Markdown 格式，提升可读性
+    
+    QQ Markdown 支持的子集：标题(#)、粗体(**)、行内代码(`)、代码块(```)、
+    列表(-)、引用(>)、分隔线(---)、链接([text](url))
+    不支持：表格、HTML 标签
+    
+    限制：单条消息不超过 4000 字符
+    """
+    if not text:
+        return text
+    
+    lines = text.split('\n')
+    result = []
+    in_code_block = False
+    
+    for line in lines:
+        # 代码块边界
+        if line.strip().startswith('```'):
+            in_code_block = not in_code_block
+            result.append(line)
+            continue
+        
+        if in_code_block:
+            result.append(line)
+            continue
+        
+        stripped = line.strip()
+        
+        # 已经是 Markdown 格式的行，保持不变
+        if stripped.startswith('#') or stripped.startswith('```') or stripped.startswith('- ') or stripped.startswith('> ') or stripped.startswith('**') or stripped.startswith('---'):
+            result.append(line)
+            continue
+        
+        # 空行保持
+        if not stripped:
+            result.append('')
+            continue
+        
+        # 数字编号行 "1. xxx" / "2. xxx" — 保持
+        if _re.match(r'^\d+\.\s', stripped):
+            result.append(line)
+            continue
+        
+        result.append(line)
+    
+    output = '\n'.join(result)
+    
+    # QQ Markdown 4000 字符限制
+    if len(output) > 3900:
+        output = output[:3850] + '\n\n---\n*(内容过长，已截断)*'
+    
+    return output
 
 
 # ── 模块级实例 ────────────────────────────────────────────────────────────

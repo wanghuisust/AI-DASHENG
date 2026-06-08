@@ -17,3 +17,7 @@ tmp_*.py
 .hermes/
 src/2025-01-01
 "!data/.cache/"  
+tmp_*.html
+tmp_*.txt
+tmp_*.cookie.txt
+check_ws.py
