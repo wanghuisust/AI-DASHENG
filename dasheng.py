@@ -30,7 +30,11 @@ if (
     and _VENV_PY.exists()
     and Path(sys.executable).resolve() != _VENV_PY.resolve()
 ):
-    os.execv(str(_VENV_PY), [str(_VENV_PY)] + sys.argv)
+    # 设置 UTF-8 环境变量后再重启，避免中文乱码
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    os.environ["PYTHONUTF8"] = "1"
+    result = subprocess.run([str(_VENV_PY)] + sys.argv, cwd=str(Path(__file__).resolve().parent))
+    sys.exit(result.returncode)
 
 # Windows UTF-8 输出支持
 if sys.platform == "win32":
@@ -502,12 +506,15 @@ def setup():
 
     # 跳过 LLM 配置
     if choice == "0":
-        echo_warn("已跳过 LLM 配置")
-        echo_info("稍后可在项目根目录的 .env 文件中配置以下项：")
-        click.echo("  OPENAI_API_KEY=你的API密钥")
-        click.echo("  OPENAI_BASE_URL=https://api.openai.com/v1")
-        click.echo("  MODEL_NAME=gpt-4o-mini")
-        click.echo("  MODEL_CONTEXT_LENGTH=128000")
+        if current_base_url or current_model:
+            echo_ok("保留当前 LLM 配置")
+        else:
+            echo_warn("已跳过 LLM 配置")
+            echo_info("稍后可在项目根目录的 .env 文件中配置以下项：")
+            click.echo("  OPENAI_API_KEY=你的API密钥")
+            click.echo("  OPENAI_BASE_URL=https://api.openai.com/v1")
+            click.echo("  MODEL_NAME=gpt-4o-mini")
+            click.echo("  MODEL_CONTEXT_LENGTH=128000")
         # 保留已有配置不覆盖
         for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL_NAME", "MODEL_CONTEXT_LENGTH"]:
             if key not in env:
