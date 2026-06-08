@@ -22,6 +22,16 @@ from pathlib import Path
 
 import click
 
+# ── 自动使用 .venv Python 重启 ──────────────────────────────────────────────
+# 如果当前 Python 不是 .venv 的，自动用 .venv 重启自身（确保依赖一致）
+_VENV_PY = Path(__file__).resolve().parent / ".venv" / "Scripts" / "python.exe"
+if (
+    sys.platform == "win32"
+    and _VENV_PY.exists()
+    and Path(sys.executable).resolve() != _VENV_PY.resolve()
+):
+    os.execv(str(_VENV_PY), [str(_VENV_PY)] + sys.argv)
+
 # Windows UTF-8 输出支持
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
