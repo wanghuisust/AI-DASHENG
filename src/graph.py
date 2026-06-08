@@ -17,8 +17,8 @@
                     └──────────┘
 """
 
+import json
 import os
-import re
 import threading
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
@@ -238,80 +238,36 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
             _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
         print(f"[{_ts}] [LLM] invoke OK: {_resp_chars} chars{_resp_tc}", flush=True)
         
-        # ── 空意图重试：用户明确要求执行任务，但 LLM 没调工具也没给出实质结果 ──
-        # Hermes 的做法：信任 LLM 判断，没调工具就认为不需要工具，直接返回。
-        # 但小模型有时会"只说不做"（如"让我查一下"却不生成 tool_call），
-        # 所以仅在用户意图明确需要工具、且 LLM 回复确无实质内容时才重试。
+        # ── 空回复处理（与 Hermes 对齐：信任 LLM 判断）──
+        # Hermes 的做法：LLM 返回纯文本 → 直接返回，没有"空意图重试"。
+        # 小模型可能"只说不做"，但强制重试往往让情况更糟。
+        # 只在 LLM 完全没输出（空字符串）时才重试一次。
         if not (hasattr(response, 'tool_calls') and response.tool_calls) and response.content:
             _content = response.content if isinstance(response.content, str) else str(response.content)
             
-            # 回复有实质内容（结构性标记或足够长）→ 直接返回，无需重试
-            _has_substance = any(kw in _content for kw in [
-                "：\n", ":\n", "```", "1.", "2.", "•", "►",
-                "G:\\", "C:\\", "/home", "http://", "https://",
-                "详细如下", "列出如下", "找到以下", "结果如下",
-            ]) or len(_content) >= 150
-            
-            # 用户消息是否明确要求执行任务（指令性动词+任务对象）
-            # 不是闲聊词表——而是检测用户意图是否需要工具介入
-            _task_intent = bool(re.search(
-                r'(帮|请|给|查|找|搜|写|改|删|跑|执行|运行|安装|下载|创建|打开|显示|列出|'
-                r'看看|检查|分析|计算|转换|发送|上传|对比|总结|翻译|'
-                r'how\s+to|what\s+is|why|where|find|search|list|show|run|exec|'
-                r'install|download|create|delete|open|check|fix)',
-                last_user_msg, re.IGNORECASE
-            ))
-            
-            # 核心判断：有实质内容 → 直接返回；无实质+用户要执行任务 → 重试；无实质+闲聊 → 直接返回
-            if _has_substance:
-                pass  # 有实质内容，正常返回
-            elif not _task_intent:
-                # 用户没有要求执行任务（闲聊/问候/确认），直接返回 LLM 回复
-                print(f"[{_ts}] [EMPTY-INTENT] 用户无任务意图，直接返回: '{_content[:60]}'", flush=True)
-            else:
-                print(f"[{_ts}] [EMPTY-INTENT] LLM回复太短且无实质内容: '{_content[:60]}'，重试", flush=True)
-                # 最多重试3次，逐步加强提示
-                _retry_prompts = [
-                    "[系统提示：你刚才只说了要做事但没有调用工具。请直接调用工具函数，不要只说'让我查询'。]",
-                    "[系统警告：你连续两次只说不做！必须立即调用工具，否则无法完成任务。直接输出tool_call。]",
-                    "[系统强制：这是最后一次机会。立刻调用terminal_execute或其他工具，不要再输出任何文字说明。]",
-                ]
-                for _ri, _prompt in enumerate(_retry_prompts):
-                    retry_messages = full_messages + [response, HumanMessage(content=_prompt)]
-                    _retry_result = [None]
-                    _retry_error = [None]
-                    def _do_retry(_msgs=retry_messages):
-                        try:
-                            _retry_result[0] = llm.invoke(_msgs)
-                        except Exception as e:
-                            _retry_error[0] = e
-                    _retry_thread = threading.Thread(target=_do_retry, daemon=True)
-                    _retry_thread.start()
-                    while _retry_thread.is_alive():
-                        if cancel_event and cancel_event.is_set():
-                            return {"messages": [AIMessage(content="(请求已取消)")]}
-                        _retry_thread.join(timeout=2)
-                    if _retry_error[0]:
-                        print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}失败: {str(_retry_error[0])[:200]}", flush=True)
-                        break
+            if not _content.strip():
+                print(f"[{_ts}] [EMPTY-INTENT] LLM 返回空内容，重试一次", flush=True)
+                retry_messages = full_messages + [response, HumanMessage(
+                    content="[系统提示：你刚才没有给出任何回复，请重新回答用户的问题。如果需要查找信息，请直接调用工具。]"
+                )]
+                _retry_result = [None]
+                _retry_error = [None]
+                def _do_retry(_msgs=retry_messages):
+                    try:
+                        _retry_result[0] = llm.invoke(_msgs)
+                    except Exception as e:
+                        _retry_error[0] = e
+                _retry_thread = threading.Thread(target=_do_retry, daemon=True)
+                _retry_thread.start()
+                while _retry_thread.is_alive():
+                    if cancel_event and cancel_event.is_set():
+                        return {"messages": [AIMessage(content="(请求已取消)")]}
+                    _retry_thread.join(timeout=2)
+                if _retry_error[0]:
+                    print(f"[{_ts}] [EMPTY-INTENT] 重试失败: {str(_retry_error[0])[:200]}", flush=True)
+                else:
                     response = _retry_result[0]
-                    _resp_chars = len(str(response.content)) if response.content else 0
-                    _resp_tc = ''
-                    if hasattr(response, 'tool_calls') and response.tool_calls:
-                        _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
-                        print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}成功: {_resp_chars} chars{_resp_tc}", flush=True)
-                        break  # 成功生成tool_calls，退出重试
-                    # 检查重试结果是否有实质内容
-                    _retry_content = response.content if isinstance(response.content, str) else str(response.content or "")
-                    _retry_has_substance = any(kw in _retry_content for kw in [
-                        "：\n", ":\n", "```", "1.", "2.", "G:\\", "C:\\",
-                        "详细如下", "列出如下", "找到以下", "结果如下",
-                    ]) or len(_retry_content) >= 150
-                    if _retry_has_substance:
-                        print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}给出实质内容: {_resp_chars} chars", flush=True)
-                        break
-                    print(f"[{_ts}] [EMPTY-INTENT] 重试{_ri+1}仍无tool_call: '{_retry_content[:60]}'", flush=True)
-                    # 继续下一次重试
+                    print(f"[{_ts}] [EMPTY-INTENT] 重试成功: {len(str(response.content or ''))} chars", flush=True)
     except Exception as e:
         import traceback as _tb
         _error_full = str(e)
@@ -454,19 +410,11 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
             return "end"
         if count >= SAME_TOOL_LIMIT:
             if _is_making_progress(tool_name):
-                # 在进步 → 不杀，但在 LLM 上下文中注入提示让它收敛
-                print(f"[{_ts}] [LOOP-DETECT] 同工具 {tool_name} 调用 {count} 次但在进步，注入收敛提示", flush=True)
-                # 给最后一条 AI 消息追加提示，引导 LLM 总结现有结果
-                if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                    # 在 tool_call 的消息里塞一段 content 提示
-                    _hint = (f"\n[系统警告：{tool_name} 已调用 {count} 次。"
-                             f"请基于已有结果总结回答用户，不要再调用 {tool_name}。"
-                             f"如果信息不足，直接告诉用户你找到了什么。]")
-                    if last_message.content:
-                        last_message.content += _hint
-                    else:
-                        last_message.content = _hint
-                return "tools"  # 放行这次，让 LLM 看到提示后自己收敛
+                # 在进步 → 不杀，也不注入畸形消息（与 Hermes 对齐：信任 LLM 自己收敛）
+                print(f"[{_ts}] [LOOP-DETECT] 同工具 {tool_name} 调用 {count} 次但在进步，放行", flush=True)
+                # 不修改 last_message.content——在带 tool_calls 的 AIMessage 里塞文本
+                # 会导致 LLM 收到畸形消息，行为不可预测
+                return "tools"
             else:
                 # 没进步（结果都一样）→ 真死循环，杀
                 print(f"[{_ts}] [LOOP-DETECT] 同类重复(无进步): {tool_name} 被调用 {count} 次，结果均相同，强制结束", flush=True)
