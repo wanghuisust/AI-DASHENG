@@ -20,7 +20,12 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-import click
+try:
+    import click
+except ImportError:
+    print("❌ 缺少 click 依赖，正在自动安装...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "click", "-q"])
+    import click
 
 # ── 自动使用 .venv Python 重启 ──────────────────────────────────────────────
 # 如果当前 Python 不是 .venv 的，自动用 .venv 重启自身（确保依赖一致）
