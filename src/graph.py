@@ -48,7 +48,7 @@ def create_llm(model: str = None, base_url: str = None, api_key: str = None):
     from dotenv import load_dotenv
     from pathlib import Path
     env_path = Path(__file__).resolve().parent.parent / ".env"
-    load_dotenv(env_path)
+    load_dotenv(env_path, override=True)
 
     _model = model or os.getenv("MODEL_NAME", "gpt-4o-mini")
     _base_url = base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")

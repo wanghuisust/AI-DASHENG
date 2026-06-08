@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(env_path)
+load_dotenv(env_path, override=True)
 
 # Agent API 地址
 AGENT_API = os.getenv("AGENT_API_URL", "http://127.0.0.1:8900")

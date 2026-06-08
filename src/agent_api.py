@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(env_path)
+load_dotenv(env_path, override=True)
 
 from graph import build_graph
 from persistence import get_store

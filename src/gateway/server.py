@@ -37,7 +37,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 加载 .env 配置
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 # 确保项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
