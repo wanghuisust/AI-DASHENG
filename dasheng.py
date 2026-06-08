@@ -460,6 +460,15 @@ def setup():
     echo_info("【第一步】配置 LLM 大模型 API")
     click.echo("")
 
+    # 显示当前配置
+    current_base_url = env.get("OPENAI_BASE_URL", "")
+    current_key = env.get("OPENAI_API_KEY", "")
+    current_model = env.get("MODEL_NAME", "")
+    if current_base_url or current_model:
+        echo_ok(f"当前配置: {current_model} @ {current_base_url} (Key: {current_key[:8]}...)")
+        click.echo("  回车跳过 = 保留以上配置")
+        click.echo("")
+
     # 选择提供商
     providers = {
         "1": ("OpenAI 官方", "https://api.openai.com/v1", "gpt-4o-mini"),
@@ -477,10 +486,9 @@ def setup():
     click.echo("请选择 LLM 提供商:")
     for k, (name, _, _) in providers.items():
         click.echo(f"  {k}. {name}")
-    click.echo("  0. 跳过（稍后在 .env 文件中手动配置）")
+    click.echo("  0. 跳过（保留当前配置 / 稍后在 .env 中配置）")
 
     current_provider_hint = ""
-    current_base_url = env.get("OPENAI_BASE_URL", "")
     if current_base_url:
         for k, (name, url, _) in providers.items():
             if url and url in current_base_url:
@@ -489,7 +497,7 @@ def setup():
 
     choice = click.prompt(
         f"请输入编号{current_provider_hint}",
-        type=str, default="1"
+        type=str, default="0" if current_base_url else "1"
     )
 
     # 跳过 LLM 配置
@@ -571,6 +579,10 @@ def setup():
 
     current_qq_id = env.get("QQ_APP_ID", "")
     current_qq_secret = env.get("QQ_APP_SECRET", "")
+    if current_qq_id:
+        echo_ok(f"当前配置: QQ App ID = {current_qq_id}")
+        click.echo("  回车跳过 = 保留以上配置")
+        click.echo("")
 
     qq_app_id = click.prompt(
         f"QQ App ID{f' (当前: {current_qq_id})' if current_qq_id else ' (在 q.qq.com 创建机器人获取)'}",
@@ -601,8 +613,12 @@ def setup():
     click.echo("")
 
     current_wechat = env.get("WECHAT_ENABLED", "false")
+    if current_wechat == "true":
+        echo_ok("当前配置: 微信已启用")
+        click.echo("  回车跳过 = 保留以上配置")
+        click.echo("")
     wechat_enabled = click.prompt(
-        "是否启用微信接入？(y/n)",
+        f"是否启用微信接入？(y/n)",
         type=str, default="y" if current_wechat == "true" else "n"
     )
 
@@ -675,6 +691,9 @@ def setup():
     click.echo("")
 
     current_gateway_port = env.get("GATEWAY_PORT", str(GATEWAY_PORT))
+    echo_ok(f"当前配置: Gateway 端口 = {current_gateway_port}")
+    click.echo("  回车跳过 = 保留以上配置")
+    click.echo("")
     gateway_port = click.prompt(
         "Gateway 端口",
         type=str, default=current_gateway_port
