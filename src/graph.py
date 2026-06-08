@@ -18,6 +18,7 @@
 """
 
 import os
+import re
 import threading
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
@@ -237,29 +238,37 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
             _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
         print(f"[{_ts}] [LLM] invoke OK: {_resp_chars} chars{_resp_tc}", flush=True)
         
-        # ── 空意图重试：LLM 说要做什么但没生成 tool_calls ──
+        # ── 空意图重试：用户明确要求执行任务，但 LLM 没调工具也没给出实质结果 ──
+        # Hermes 的做法：信任 LLM 判断，没调工具就认为不需要工具，直接返回。
+        # 但小模型有时会"只说不做"（如"让我查一下"却不生成 tool_call），
+        # 所以仅在用户意图明确需要工具、且 LLM 回复确无实质内容时才重试。
         if not (hasattr(response, 'tool_calls') and response.tool_calls) and response.content:
             _content = response.content if isinstance(response.content, str) else str(response.content)
-            # 空意图判定：短回复(<150字) + 没有实质性结果内容
-            # "实质"= LLM 实际给出了数据/列表/路径/代码，而不是复述用户意图
+            
+            # 回复有实质内容（结构性标记或足够长）→ 直接返回，无需重试
             _has_substance = any(kw in _content for kw in [
                 "：\n", ":\n", "```", "1.", "2.", "•", "►",
                 "G:\\", "C:\\", "/home", "http://", "https://",
                 "详细如下", "列出如下", "找到以下", "结果如下",
-            ]) or len(_content) >= 150  # 长回复大概率有实质内容
-            _is_intent_only = not _has_substance
+            ]) or len(_content) >= 150
             
-            # ── 闲聊豁免：用户消息是简单问候/闲聊，不需要工具，跳过重试 ──
-            _chitchat_patterns = [
-                "在吗", "在不在", "你好", "嗨", "hi", "hello", "嘿",
-                "早上好", "晚上好", "早安", "晚安", "中午好",
-                "谢谢", "好的", "嗯嗯", "知道了", "收到", "ok",
-                "你是谁", "你叫什么", "你能做什么",
-            ]
-            _is_chitchat = (len(last_user_msg) < 30 and 
-                           any(p in last_user_msg.lower() for p in _chitchat_patterns))
+            # 用户消息是否明确要求执行任务（指令性动词+任务对象）
+            # 不是闲聊词表——而是检测用户意图是否需要工具介入
+            _task_intent = bool(re.search(
+                r'(帮|请|给|查|找|搜|写|改|删|跑|执行|运行|安装|下载|创建|打开|显示|列出|'
+                r'看看|检查|分析|计算|转换|发送|上传|对比|总结|翻译|'
+                r'how\s+to|what\s+is|why|where|find|search|list|show|run|exec|'
+                r'install|download|create|delete|open|check|fix)',
+                last_user_msg, re.IGNORECASE
+            ))
             
-            if _is_intent_only and not _is_chitchat:
+            # 核心判断：有实质内容 → 直接返回；无实质+用户要执行任务 → 重试；无实质+闲聊 → 直接返回
+            if _has_substance:
+                pass  # 有实质内容，正常返回
+            elif not _task_intent:
+                # 用户没有要求执行任务（闲聊/问候/确认），直接返回 LLM 回复
+                print(f"[{_ts}] [EMPTY-INTENT] 用户无任务意图，直接返回: '{_content[:60]}'", flush=True)
+            else:
                 print(f"[{_ts}] [EMPTY-INTENT] LLM回复太短且无实质内容: '{_content[:60]}'，重试", flush=True)
                 # 最多重试3次，逐步加强提示
                 _retry_prompts = [
