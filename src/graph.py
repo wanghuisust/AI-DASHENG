@@ -150,6 +150,48 @@ _memory = Memory()
 _skill_manager = SkillManager(os.path.join(os.path.dirname(__file__), "..", "data", "skills"))
 
 
+def _ensure_message_role_continuity(messages: list) -> list:
+    """确保消息角色连续性：每个 ToolMessage 前面必须有配对的 AIMessage（带 tool_calls）。
+    
+    根因：trim_messages_to_tokens 从后往前截断，可能截掉 AI tool_calls 消息但保留其后的 ToolMessage；
+    compress_messages 把旧消息压成摘要，AI tool_calls 结构信息丢失，ToolMessage 变成孤立。
+    这导致 API 报 400: "No user query found in messages"。
+    """
+    if not messages:
+        return messages
+    
+    # 收集所有 AI 消息的 tool_call_id
+    ai_tool_ids = set()
+    for msg in messages:
+        if hasattr(msg, 'type') and msg.type == 'ai' and hasattr(msg, 'tool_calls') and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tc_id = tc.get('id', '')
+                if tc_id:
+                    ai_tool_ids.add(tc_id)
+    
+    # 从后往前扫描，跳过没有配对 AI 的 ToolMessage
+    cleaned = []
+    skipped = 0
+    for msg in messages:
+        if hasattr(msg, 'type') and msg.type == 'tool':
+            tc_id = getattr(msg, 'tool_call_id', '')
+            if tc_id and tc_id not in ai_tool_ids:
+                skipped += 1
+                print(f"[MSG-FIX] Skipping orphan ToolMessage: tool_call_id={tc_id}, name={getattr(msg, 'name', '?')}", flush=True)
+                continue
+        cleaned.append(msg)
+    
+    if skipped:
+        print(f"[MSG-FIX] Removed {skipped} orphan ToolMessage(s), {len(messages)} → {len(cleaned)} messages", flush=True)
+    
+    # 确保不以 ToolMessage 开头（第一条非 system 消息必须是 human）
+    while cleaned and hasattr(cleaned[0], 'type') and cleaned[0].type == 'tool':
+        print(f"[MSG-FIX] Removing leading ToolMessage: {getattr(cleaned[0], 'name', '?')}", flush=True)
+        cleaned.pop(0)
+    
+    return cleaned
+
+
 def _detect_stuck_loop(messages: list) -> list:
     """检测并清理 AI 死循环：连续多条 AI 回复都说'无法连接/失败'但没有 tool_calls
     保留第一条和最后一条，中间的替换为一条摘要
@@ -217,6 +259,9 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
 
     # 2. Token 截断：硬性限制
     messages = trim_messages_to_tokens(messages)
+
+    # 2.5 消息角色连续性校验：确保 trim/compress 后没有孤立 ToolMessage
+    messages = _ensure_message_role_continuity(messages)
 
     # 3. 构建 system prompt（基础 + 记忆 + 匹配的技能）
     system_content = SYSTEM_PROMPT
