@@ -221,14 +221,38 @@ triggers: [{', '.join(triggers)}]
         return True
 
     def get_context_for_query(self, query: str) -> str:
-        """获取与查询匹配的技能上下文，用于注入 system prompt"""
-        matched = self.match(query)
-        if not matched:
+        """构建全量技能索引注入 system prompt（对标 Hermes 方案）
+        
+        Hermes 的做法：把所有 skill 的名称+描述作为索引写进 system prompt，
+        让 LLM 自行判断该加载哪个 skill，再用 skill_view 加载具体内容。
+        这比 trigger 关键词匹配更灵活，不依赖 frontmatter 中是否有 triggers 字段。
+        """
+        if not self.skills:
             return ""
-        parts = ["\n\n# 匹配到的技能（优先按这些技能的步骤执行）"]
-        for skill in matched:
-            parts.append(skill.to_prompt())
-        return "\n\n".join(parts)
+        
+        # 构建紧凑的技能索引
+        index_lines = []
+        for name in sorted(self.skills.keys()):
+            skill = self.skills[name]
+            desc = skill.description or ""
+            if desc:
+                index_lines.append(f"  - {name}: {desc}")
+            else:
+                index_lines.append(f"  - {name}")
+        
+        result = (
+            "\n\n## Skills（强制规则）\n"
+            "回复前，扫描下面的技能列表。如果有技能匹配或部分相关，"
+            "**必须**先用 skill_view(name) 加载该技能，然后严格按技能步骤执行。"
+            "宁可多加载不需要的技能，也不要漏掉关键步骤、陷阱或已验证的工作流。"
+            "技能包含专业知识——API 端点、工具命令、经过验证的工作流，比通用方法更好。"
+            "即使你认为用基本工具就能完成任务，也要加载技能，因为技能定义了在这里应该怎么做。\n\n"
+            "<available_skills>\n"
+            + "\n".join(index_lines) + "\n"
+            "</available_skills>\n\n"
+            "只有确实没有任何技能与任务相关时，才可以不加载技能。"
+        )
+        return result
 
     # ── 安装功能 ──────────────────────────────────────────
 

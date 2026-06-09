@@ -97,6 +97,34 @@ def skill_search(query: str, limit: int = 10) -> str:
 
 
 @tool
+def skill_view(name: str) -> str:
+    """加载并查看技能的详细内容。当 system prompt 中的技能索引有匹配时，必须先用此工具加载技能详情。
+
+    Args:
+        name: 技能名称（如 "github-repo-management"、"systematic-debugging"）
+
+    Returns:
+        技能的完整内容（含步骤、命令、陷阱等），用于指导执行
+    """
+    _sm = _get_skill_manager()
+    if not _sm:
+        return "[错误] SkillManager 未初始化"
+
+    skill = _sm.get(name)
+    if not skill:
+        # 模糊匹配：名称部分包含
+        candidates = [s for s in _sm.skills if name.lower() in s.lower()]
+        if len(candidates) == 1:
+            skill = _sm.skills[candidates[0]]
+        elif candidates:
+            return f"未找到 '{name}'，相似技能: {', '.join(candidates[:5])}"
+        else:
+            return f"未找到技能 '{name}'。用 skill_list() 查看所有可用技能"
+
+    return skill.to_prompt()
+
+
+@tool
 def skill_remove(name: str) -> str:
     """删除已安装的技能。
 
