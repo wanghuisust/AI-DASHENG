@@ -1,10 +1,11 @@
 """网络搜索工具 — 多源并行搜索，汇总去重
 
-支持搜索源：
-1. DuckDuckGo (duckduckgo-search 库，通过代理) — 英文主要源
-2. 头条搜索（直连，中文主要源）— 中文内容质量最好
-3. Bing HTML 搜索（通过代理，备用）
-4. Brave Search API（无需代理，备用，需配置 BRAVE_API_KEY）
+支持搜索源（按优先级）：
+1. AnySearch API（直连，AI 搜索引擎，无需代理）— 优先源
+2. Bing（通过代理，HTML 爬虫）— 优先源
+3. 头条搜索（直连，中文主要源）— 中文内容质量好
+4. DuckDuckGo (duckduckgo-search 库，通过代理) — 英文备用源
+5. Brave Search API（无需代理，备用，需配置 BRAVE_API_KEY）
 
 所有源并行调用，汇总结果去重后取前 max_results 条。
 """
@@ -21,6 +22,84 @@ from langchain_core.tools import tool
 # 从环境变量读取代理和 API key
 _PROXY = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "http://127.0.0.1:7897"
 _BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
+_ANYSEARCH_API_KEY = os.environ.get("ANYSEARCH_API_KEY", "")
+
+
+def _search_anysearch(query, count=10):
+    """用 AnySearch API 搜索（直连，无需代理，AI 搜索引擎）"""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": query, "max_results": min(count, 10)},
+            },
+        }
+        headers = {"Content-Type": "application/json"}
+        if _ANYSEARCH_API_KEY:
+            headers["Authorization"] = f"Bearer {_ANYSEARCH_API_KEY}"
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.anysearch.com/mcp",
+            data=data,
+            headers=headers,
+            method="POST",
+        )
+        # 直连，不走代理
+        no_proxy = urllib.request.ProxyHandler({})
+        ssl_ctx = ssl._create_unverified_context()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl_ctx), no_proxy
+        )
+        resp = opener.open(req, timeout=20)
+        resp_data = json.loads(resp.read().decode("utf-8"))
+
+        if "error" in resp_data:
+            return None
+
+        content = resp_data.get("result", {}).get("content", [])
+        text = ""
+        for item in content:
+            if item.get("type") == "text":
+                text = item.get("text", "")
+                break
+
+        if not text:
+            return None
+
+        # 解析 AnySearch Markdown 格式的搜索结果
+        results = []
+        current = {}
+        for line in text.split("\n"):
+            # 标题行: ### N. Title
+            m = re.match(r"^###\s+\d+\.\s+(.+)$", line.strip())
+            if m:
+                if current.get("title"):
+                    results.append(current)
+                current = {"title": m.group(1).strip(), "url": "", "snippet": ""}
+                continue
+            # URL 行: - **URL**: https://...
+            m = re.match(r"^-?\s*\*{0,2}URL\*{0,2}:\s*(https?://\S+)", line.strip())
+            if m:
+                current["url"] = m.group(1).strip()
+                continue
+            # 摘要行: 以 - 开头但不是 URL 的
+            m = re.match(r"^-\s+(.+)$", line.strip())
+            if m and "URL" not in line:
+                snippet = m.group(1).strip()
+                if len(snippet) > 10:
+                    current["snippet"] = snippet[:300]
+                continue
+
+        if current.get("title"):
+            results.append(current)
+
+        return results if results else None
+    except Exception:
+        return None
 
 
 def _search_ddg(query, count=10):
@@ -200,7 +279,8 @@ def _dedupe_results(all_results):
 def web_search(query: str, max_results: int = 10) -> str:
     """搜索互联网获取信息。当用户问的问题需要最新资讯、事实查证或你不了解的知识时使用。
 
-    并行调用 DuckDuckGo、Bing、Brave（如已配置），汇总去重后返回结果。
+    并行调用 AnySearch、Bing、头条、DDG、Brave（如已配置），汇总去重后返回结果。
+    AnySearch 和 Bing 为优先源，质量和覆盖度最好。
 
     Args:
         query: 搜索关键词
@@ -208,9 +288,10 @@ def web_search(query: str, max_results: int = 10) -> str:
     """
     try:
         sources = {
+            "AnySearch": _search_anysearch,
+            "Bing": _search_bing,
             "头条": _search_toutiao,
             "DDG": _search_ddg,
-            "Bing": _search_bing,
         }
         if _BRAVE_API_KEY:
             sources["Brave"] = _search_brave
