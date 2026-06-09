@@ -595,7 +595,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     try:
                         invoke_result[0] = _sync_graph.invoke(
                             {"messages": messages},
-                            config={"recursion_limit": 40},
+                            config={"recursion_limit": 80},
                         )
                     except Exception as e:
                         # GraphRecursionError: 达到 recursion_limit
@@ -754,7 +754,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                             async for event in _cancelable_graph.astream_events(
                                 {"messages": messages},
                                 version="v2",
-                                config={"recursion_limit": 40},
+                                config={"recursion_limit": 80},
                             ):
                                 if _local_cancel.is_set() or _stream_done[0]:
                                     break
