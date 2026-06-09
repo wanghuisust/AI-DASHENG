@@ -44,8 +44,8 @@ Verification you may run:
 - [COMMAND_2]
 
 Verification DASHENG will rerun independently:
-- [HERMES_COMMAND_1]
-- [HERMES_COMMAND_2]
+- [DASHENG_COMMAND_1]
+- [DASHENG_COMMAND_2]
 
 Required final report:
 - Summary of changes.

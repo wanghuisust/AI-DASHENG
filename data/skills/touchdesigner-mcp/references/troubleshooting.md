@@ -137,7 +137,7 @@ actual = str(n.width) + 'x' + str(n.height)
 
 ### Config location
 
-`$HERMES_HOME/config.yaml` (defaults to `~/.dasheng/config.yaml` when `HERMES_HOME` is unset)
+`$DASHENG_HOME/config.yaml` (defaults to `~/.dasheng/config.yaml` when `DASHENG_HOME` is unset)
 
 ### MCP entry format
 
