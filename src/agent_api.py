@@ -356,6 +356,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         # GET /v1/status — 模型 + Gateway 状态
         if path == "/v1/status":
             self._handle_status()
+        # GET /v1/models — 可用模型列表
+        elif path == "/v1/models":
+            self._handle_list_models()
         # GET /v1/threads — 会话列表
         elif path == "/v1/threads":
             threads = store.list_threads()
