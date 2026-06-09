@@ -221,25 +221,95 @@ triggers: [{', '.join(triggers)}]
         return True
 
     def get_context_for_query(self, query: str) -> str:
-        """构建全量技能索引注入 system prompt（对标 Hermes 方案）
+        """构建技能上下文注入 system prompt
         
-        Hermes 的做法：把所有 skill 的名称+描述作为索引写进 system prompt，
-        让 LLM 自行判断该加载哪个 skill，再用 skill_view 加载具体内容。
-        这比 trigger 关键词匹配更灵活，不依赖 frontmatter 中是否有 triggers 字段。
+        策略（双层）：
+        1. 全量技能索引（名称+描述）— 让 LLM 扫描判断
+        2. 关键词匹配到的技能直接注入完整内容 — 不依赖 LLM 主动调 skill_view
         """
         if not self.skills:
             return ""
         
+        query_lower = query.lower()
+        
         # 构建紧凑的技能索引
         index_lines = []
+        matched_skills = []  # 关键词匹配到的技能，直接注入完整内容
+        
         for name in sorted(self.skills.keys()):
             skill = self.skills[name]
             desc = skill.description or ""
+            
+            # 检查是否匹配当前查询
+            is_match = False
+            # 名称匹配（完整名称或关键部分，或中文关键词映射）
+            name_parts = skill.name.lower().split("-")
+            if skill.name.lower() in query_lower or any(part in query_lower for part in name_parts if len(part) > 3):
+                is_match = True
+            # 中文关键词映射：常见任务关键词 → 技能名称
+            if not is_match:
+                keyword_map = {
+                    "拉取": ["github-repo-management", "china-github-mirror-download"],
+                    "源码": ["github-repo-management"],
+                    "clone": ["github-repo-management"],
+                    "仓库": ["github-repo-management"],
+                    "对比": ["github-repo-management"],
+                    "git": ["github-repo-management"],
+                    "下载": ["china-github-mirror-download"],
+                    "安装": ["china-github-mirror-download"],
+                    "调试": ["python-debugger", "python-debugpy", "systematic-debugging"],
+                    "部署": ["server-deploy", "selfhosted-remote-desktop", "server-preview"],
+                    "ssh": ["ssh-tunnel-expose", "windows-ssh-tunnel-service"],
+                    "隧道": ["ssh-tunnel-expose", "windows-ssh-tunnel-service"],
+                    "代理": ["china-github-mirror-download"],
+                    "训练": ["local-llm-finetuning", "axolotl", "unsloth"],
+                    "微调": ["local-llm-finetuning", "axolotl", "unsloth"],
+                    "语音": ["local-tts-voice-cloning", "gpt-sovits-pipeline"],
+                    "tts": ["local-tts-voice-cloning", "gpt-sovits-pipeline"],
+                    "音乐": ["heartmula", "audiocraft-audio-generation", "ace-step-music-generation"],
+                    "视频": ["manim-video", "ascii-video", "vocal-separation"],
+                    "测试": ["test-driven-development"],
+                    "review": ["requesting-code-review", "github-code-review"],
+                    "pr": ["github-pr-workflow", "github-code-review"],
+                    "issue": ["github-issues"],
+                    "搜索": ["web_search"],
+                    "日志": ["systematic-debugging"],
+                }
+                for kw, skill_names in keyword_map.items():
+                    if kw in query_lower:
+                        if skill.name in skill_names:
+                            is_match = True
+                            break
+            # 描述匹配（只匹配中文关键词，避免英文短词误匹配）
+            if desc and not is_match:
+                # 去掉首尾引号
+                clean_desc = desc.strip("\"'")
+                # 只提取描述中的中文部分（顿号分隔的中文关键词）
+                for sep in ["、"]:
+                    for kw in clean_desc.split(sep):
+                        kw = kw.strip().strip("\"'")
+                        # 只匹配中文关键词（长度>=2且包含中文字符）
+                        if len(kw) >= 2 and any('\u4e00' <= c <= '\u9fff' for c in kw):
+                            if kw.lower() in query_lower:
+                                is_match = True
+                                break
+                    if is_match:
+                        break
+            # triggers 匹配
+            for trigger in skill.triggers:
+                if trigger.lower() in query_lower:
+                    is_match = True
+                    break
+            
             if desc:
                 index_lines.append(f"  - {name}: {desc}")
             else:
                 index_lines.append(f"  - {name}")
+            
+            if is_match:
+                matched_skills.append(skill)
         
+        # 构建索引部分
         result = (
             "\n\n## Skills（强制规则）\n"
             "回复前，扫描下面的技能列表。如果有技能匹配或部分相关，"
@@ -252,6 +322,14 @@ triggers: [{', '.join(triggers)}]
             "</available_skills>\n\n"
             "只有确实没有任何技能与任务相关时，才可以不加载技能。"
         )
+        
+        # 匹配到的技能直接注入完整内容
+        if matched_skills:
+            result += "\n\n### 以下技能与当前任务匹配，已自动加载完整内容：\n"
+            for skill in matched_skills:
+                result += f"\n{skill.to_prompt()}\n"
+                result += "---\n"
+        
         return result
 
     # ── 安装功能 ──────────────────────────────────────────
