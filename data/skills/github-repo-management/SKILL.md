@@ -82,6 +82,25 @@ gh repo clone owner/repo-name
 gh repo clone owner/repo-name -- --depth 1
 ```
 
+### ⚠️ 中国网络环境：直连失败自动走代理
+
+如果直连 GitHub 被墙（超时/连接失败），**自动重试加代理**：
+
+```bash
+# 方式一：直接加代理参数（推荐）
+git -c http.proxy=http://127.0.0.1:7897 clone https://github.com/owner/repo-name.git
+
+# 方式二：设置环境变量
+set HTTP_PROXY=http://127.0.0.1:7897
+set HTTPS_PROXY=http://127.0.0.1:7897
+git clone https://github.com/owner/repo-name.git
+
+# 方式三：通过 gh-proxy.com 镜像
+git clone https://gh-proxy.com/https://github.com/owner/repo-name.git
+```
+
+**重要**：不要裸调 `git clone` 或 `git fetch` 直连 GitHub。**先试直连，失败后立即用代理重试**。如果旧目录有残留（如不完整的 .git），先删除再重新 clone。
+
 ## 2. Creating Repositories
 
 **With gh:**
