@@ -240,7 +240,10 @@ def _fix_empty_intent_response(response_text: str, messages: list) -> str:
     _has_substance = any(kw in response_text for kw in [
         "：\n", ":\n", "```", "1.", "2.", "G:\\", "C:\\",
         "详细如下", "列出如下", "找到以下", "结果如下",
-    ]) or len(response_text) >= 150
+        # 新增：有具体动作意图的关键词（如调工具前的声明不算空意图）
+        "安装", "搜索", "查找", "执行", "运行", "读取", "写入",
+        "克隆", "拉取", "配置", "创建", "删除", "下载",
+    ]) or len(response_text) >= 80
     is_empty_intent = not _has_substance
     if is_empty_intent:
         print(f"[EMPTY-RESULT] 回复是空意图: '{response_text[:60]}'，自动总结", flush=True)

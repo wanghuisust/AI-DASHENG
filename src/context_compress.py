@@ -330,7 +330,7 @@ def compress_messages(messages: list, llm=None) -> list:
     # Phase 1: 工具输出预处理
     messages = _prune_tool_outputs(messages)
 
-    # 检查是否需要压缩
+    # 检查是否需要压缩（双重条件：token 超阈值 OR 消息条数过多）
     total_tokens = 0
     for msg in messages:
         content = ""
@@ -341,7 +341,8 @@ def compress_messages(messages: list, llm=None) -> list:
         total_tokens += estimate_tokens(content) + 10
 
     threshold = get_compress_threshold()
-    if total_tokens < threshold:
+    need_compress = total_tokens >= threshold or len(messages) >= 40
+    if not need_compress:
         return messages
 
     # Phase 2: 计算分割点

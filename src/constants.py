@@ -13,9 +13,10 @@ def get_max_context_tokens() -> int:
     return _get_model_context_length()
 
 
-# 上下文压缩阈值：达到上下文长度的 50% 时自动压缩
+# 上下文压缩阈值：达到上下文长度的 40% 时自动压缩
+# （50% 对小上下文模型太晚了，98条消息可能已经超过实际上下文但没触发压缩）
 def get_compress_threshold() -> int:
-    return int(_get_model_context_length() * 0.5)
+    return int(_get_model_context_length() * 0.4)
 
 
 def estimate_tokens(text: str) -> int:
