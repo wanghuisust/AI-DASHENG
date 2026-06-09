@@ -271,11 +271,18 @@ def _summarize_without_tools(messages: list) -> str:
         # 只保留 system + 最后几条 + 总结请求
         summary_messages = [summary_messages[0]] + summary_messages[-5:]
     
+    import concurrent.futures
+    
     try:
-        response = llm_no_tools.invoke(summary_messages, config={"timeout": 30})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(llm_no_tools.invoke, summary_messages)
+            response = future.result(timeout=30)
         return response.content if response.content else "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
+    except concurrent.futures.TimeoutError:
+        print(f"[RECURSION-LIMIT] 无工具总结超时(30s)，返回兜底文本", flush=True)
+        return "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
     except Exception as e:
-        print(f"[RECURSION-LIMIT] 无工具总结超时或失败: {e}", flush=True)
+        print(f"[RECURSION-LIMIT] 无工具总结失败: {e}", flush=True)
         return "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
 
 
