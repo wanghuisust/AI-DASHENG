@@ -793,11 +793,10 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         )
 
         if _target:
-            # streaming 增量推送：如果已经推送了回复主体，跳过最终完整消息
-            # 判断标准：streaming 已推送量 >= 回复文本的 80%
+            # streaming 增量推送：避免和已推送内容重复
             streaming_sent = _streaming_text_sent[0]
-            if streaming_sent > 0 and streaming_sent >= len(reply_text) * 0.8:
-                # 推送剩余的尾部文本（不够 150 字阈值的那部分）
+            if streaming_sent > 0:
+                # 已有 streaming 推送，只发尚未推送的部分
                 remaining = reply_text[streaming_sent:].strip()
                 if remaining:
                     try:
@@ -807,16 +806,15 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                             text=remaining,
                             is_group=message.is_group,
                             at_user=message.user_id,
-                            raw={"is_progress": True, "is_streaming": True},
                         )
                         _target.send_reply(tail_reply)
-                        logger.info(f"[{message.platform}-streaming] 推送尾部 {len(remaining)} 字（streaming 已推送 {streaming_sent}/{len(reply_text)}）")
+                        logger.info(f"[{message.platform}-streaming] 推送剩余 {len(remaining)} 字（streaming 已推送 {streaming_sent}/{len(reply_text)}）")
                     except Exception as e:
-                        logger.warning(f"[{message.platform}-streaming] 尾部推送失败: {e}")
+                        logger.warning(f"[{message.platform}-streaming] 剩余推送失败: {e}")
                 else:
                     logger.info(f"[{message.platform}-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
             else:
-                # streaming 推送量不足（可能回复很短、或 LLM 没走 streaming 路径），发完整消息
+                # 无 streaming 推送，发完整消息
                 try:
                     _target.send_reply(reply)
                 except Exception as e:
