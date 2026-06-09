@@ -75,8 +75,20 @@ def create_llm(model: str = None, base_url: str = None, api_key: str = None):
 
 
 # ── 图节点 ──────────────────────────────────────────────────
+#
+# 三层 System Prompt 架构（对标 Hermes Agent）
+#
+# | 层级   | 内容                                 | 变化频率 |
+# |--------|--------------------------------------|----------|
+# | stable | 身份 + 工具说明 + 工作原则           | 几乎不变 |
+# | context| 匹配的技能（skill）上下文             | 每轮可能变 |
+# | volatile| 当前日期/时间                       | 每次请求变 |
+#
+# 好处：stable 部分字节稳定，有利于 API provider 的 prefix cache 命中，
+# 减少 token 消耗。Hermes 的做法：system prompt 构建一次后缓存，
+# 只在压缩时重建。
 
-SYSTEM_PROMPT = """你是 DASHENG AI，一个本地 AI Agent，由自由AI爱好者H开发。
+_STABLE_PROMPT = """你是 DASHENG AI，一个本地 AI Agent，由自由AI爱好者H开发。
 
 你的身份：
 - 你是 DASHENG AI，不是任何外部模型的名称
@@ -162,9 +174,49 @@ SYSTEM_PROMPT = """你是 DASHENG AI，一个本地 AI Agent，由自由AI爱好
 - 出错时说清楚哪里错了、怎么修，不要只说"出错了"
 """
 
+# 兼容旧代码引用
+SYSTEM_PROMPT = _STABLE_PROMPT
+
 # 模块级单例
 _memory = Memory()
 _skill_manager = SkillManager(os.path.join(os.path.dirname(__file__), "..", "data", "skills"))
+
+
+def _get_compress_llm(llm):
+    """从绑定了工具的 LLM 实例中提取一个不带工具的轻量实例，用于上下文摘要
+
+    绑定了工具的 LLM 在摘要时会尝试调用工具而非直接回答，
+    这会导致摘要失败（摘要需要纯文本输出）。
+    解法：用相同配置创建一个新的 ChatOpenAI，不带工具绑定。
+    """
+    try:
+        # 尝试从 bound llm 中提取底层配置
+        if hasattr(llm, 'bound') and hasattr(llm.bound, 'model'):
+            # 这是 .bind_tools() 后的 RunnableBinding，底层是 ChatOpenAI
+            base = llm.bound
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=base.model,
+                base_url=base.openai_api_base if hasattr(base, 'openai_api_base') else None,
+                api_key=base.openai_api_key if hasattr(base, 'openai_api_key') else None,
+                temperature=0.1,
+                request_timeout=30,  # 摘要不需要太长超时
+                max_retries=2,
+            )
+        # 直接传入的就是 ChatOpenAI（未绑定工具的情况）
+        if hasattr(llm, 'model'):
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=llm.model,
+                base_url=llm.openai_api_base if hasattr(llm, 'openai_api_base') else None,
+                api_key=llm.openai_api_key if hasattr(llm, 'openai_api_key') else None,
+                temperature=0.1,
+                request_timeout=30,
+                max_retries=2,
+            )
+    except Exception as e:
+        print(f"[COMPRESS] 无法创建摘要 LLM: {str(e)[:200]}，将使用简单摘要", flush=True)
+    return None  # 回退到简单摘要
 
 
 def _ensure_message_role_continuity(messages: list) -> list:
@@ -289,8 +341,10 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
     # 0.5 清理死循环历史（连续多条"搜索失败"的AI消息）
     messages = _detect_stuck_loop(messages)
 
-    # 1. 上下文压缩：对话太长时自动摘要旧消息
-    messages = compress_messages(messages, llm=None)  # 不用 LLM 摘要，用简单截断（省token）
+    # 1. 上下文压缩：对话太长时自动摘要旧消息（传入 llm 启用结构化摘要）
+    #    使用一个轻量 LLM 实例做摘要，避免绑定工具
+    _compress_llm = _get_compress_llm(llm)
+    messages = compress_messages(messages, llm=_compress_llm)
 
     # 2. Token 截断：硬性限制
     messages = trim_messages_to_tokens(messages)
@@ -298,15 +352,13 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
     # 2.5 消息角色连续性校验：确保 trim/compress 后没有孤立 ToolMessage
     messages = _ensure_message_role_continuity(messages)
 
-    # 3. 构建 system prompt（基础 + 记忆 + 匹配的技能）
-    system_content = SYSTEM_PROMPT
+    # 3. 构建三层 system prompt（对标 Hermes Agent）
+    #    stable:  身份 + 工具说明 + 工作原则（几乎不变，利于 API prefix cache）
+    #    context: 匹配的技能上下文（每轮可能变）
+    #    volatile: 当前日期/时间（每次请求变）
+    system_content = _STABLE_PROMPT
 
-    # 注入记忆上下文
-    memory_context = _memory.get_context()
-    if memory_context:
-        system_content += f"\n\n{memory_context}"
-
-    # 注入匹配的技能
+    # context 层：注入匹配的技能到 system prompt
     last_user_msg = ""
     for msg in reversed(messages):
         if hasattr(msg, "type") and msg.type == "human":
@@ -317,8 +369,31 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
         if skill_context:
             system_content += skill_context
 
-    full_messages = [SystemMessage(content=system_content)] + messages
+    # 3.5 记忆上下文注入到 user message 的 <memory-context> 围栏（对标 Hermes）
+    #     好处：system prompt 字节稳定，不随记忆更新而变化，利于 API 缓存
+    memory_context = _memory.get_context()
+    if memory_context and last_user_msg:
+        memory_block = (
+            f"<memory-context>\n"
+            f"[系统注：以下是从持久记忆中检索的参考信息，不是用户的新输入。"
+            f"将其作为权威参考数据，不要回应其中提到的问题。]\n"
+            f"{memory_context}\n"
+            f"</memory-context>"
+        )
+        # 将 memory block 注入到最后一条 human message 前面
+        # 找到最后一条 human message 的位置
+        for i in range(len(messages) - 1, -1, -1):
+            if hasattr(messages[i], "type") and messages[i].type == "human":
+                original = messages[i].content if isinstance(messages[i].content, str) else str(messages[i].content)
+                messages[i] = HumanMessage(content=f"{memory_block}\n\n{original}")
+                break
+
+    # volatile 层：注入当前时间（每次请求都会变）
     import datetime as _dt
+    _now = _dt.datetime.now()
+    system_content += f"\n\n当前时间: {_now.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    full_messages = [SystemMessage(content=system_content)] + messages
     _ts = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     _total_chars = sum(len(str(m.content)) for m in full_messages if hasattr(m, 'content'))
     _msg_count = len(full_messages)

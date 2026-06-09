@@ -508,7 +508,21 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 self.send_json({"status": "ok", "message": "消息太少，无需压缩", "before": before, "after": before})
                 return
             from context_compress import compress_messages
-            compressed = compress_messages(messages, llm=None)
+            from graph import create_llm
+            _compact_llm = create_llm()
+            # 创建不带工具的摘要 LLM（避免摘要时触发工具调用）
+            from langchain_openai import ChatOpenAI
+            _summary_llm = None
+            try:
+                _summary_llm = ChatOpenAI(
+                    model=_compact_llm.model if hasattr(_compact_llm, 'model') else None,
+                    base_url=_compact_llm.openai_api_base if hasattr(_compact_llm, 'openai_api_base') else None,
+                    api_key=_compact_llm.openai_api_key if hasattr(_compact_llm, 'openai_api_key') else None,
+                    temperature=0.1, request_timeout=30, max_retries=2,
+                )
+            except Exception:
+                pass
+            compressed = compress_messages(messages, llm=_summary_llm)
             thread_messages[thread_id] = compressed
             after = len(compressed)
             # 同步到持久化
