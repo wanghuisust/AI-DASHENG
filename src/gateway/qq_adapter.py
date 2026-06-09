@@ -689,8 +689,10 @@ class QQBotAdapter:
         if not self._token_mgr:
             return ""
 
-        # 统一使用纯文本 (msg_type=0)，避免 Markdown 400 错误导致消息发送失败
-        msg_type = 0
+        # 最终回复用 Markdown (msg_type=2)，进度通知用纯文本 (msg_type=0)
+        # 判断：如果 reply 有 raw.is_progress 标记，则用纯文本
+        is_progress = reply.raw.get("is_progress", False) if hasattr(reply, "raw") else False
+        msg_type = 0 if is_progress else 2
         text = reply.text
 
         if reply.is_group:

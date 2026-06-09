@@ -65,6 +65,9 @@ def create_llm(model: str = None, base_url: str = None, api_key: str = None):
         request_timeout=300,
         # 遇到 429 rate limit 自动重试，最多 5 次，指数退避
         max_retries=5,
+        # streaming=True：允许 astream_events v2 获取逐 token 事件
+        # 同时 agent_node 内部用 llm.stream() 逐 chunk 收集+合并
+        streaming=True,
     )
     if os.getenv("ENABLE_TOOLS", "true").lower() == "true":
         return llm.bind_tools(ALL_TOOLS)
@@ -208,36 +211,34 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
             _tc = f' tool_call_id={_tcid}'
         print(f"[{_ts}] [LLM]   msg[{_i}] {_role}: {_content}{_tc}", flush=True)
     try:
-        # 用线程+超时包装 llm.invoke，以便在等待 LLM 响应期间检测 cancel
-        _invoke_result = [None]
-        _invoke_error = [None]
+        # 用 llm.stream() 逐 chunk 收集，同时让 astream_events v2 能捕获每个 token
+        # 替代 llm.invoke()，后者是同步阻塞的，LLM 全部 token 完成才返回
+        _stream_chunks = []
+        _stream_interrupted = False
 
-        def _do_invoke():
-            try:
-                _invoke_result[0] = llm.invoke(full_messages)
-            except Exception as e:
-                _invoke_error[0] = e
-
-        _invoke_thread = threading.Thread(target=_do_invoke, daemon=True)
-        _invoke_thread.start()
-
-        # 每2秒检查一次 cancel，同时等 invoke 完成
-        while _invoke_thread.is_alive():
+        for chunk in llm.stream(full_messages):
             if cancel_event and cancel_event.is_set():
-                print(f"[{_ts}] [LLM] invoke CANCELLED by cancel_event", flush=True)
-                return {"messages": [AIMessage(content="(请求已取消)")]}
-            _invoke_thread.join(timeout=2)
+                print(f"[{_ts}] [LLM] stream CANCELLED by cancel_event", flush=True)
+                _stream_interrupted = True
+                break
+            _stream_chunks.append(chunk)
 
-        if _invoke_error[0]:
-            raise _invoke_error[0]
+        if _stream_interrupted:
+            return {"messages": [AIMessage(content="(请求已取消)")]}
 
-        response = _invoke_result[0]
+        # 合并所有 chunks 为完整 AIMessage
+        if _stream_chunks:
+            response = _stream_chunks[0]
+            for c in _stream_chunks[1:]:
+                response = response + c
+        else:
+            response = AIMessage(content="")
+
         _resp_chars = len(str(response.content)) if response.content else 0
         _resp_tc = ''
         if hasattr(response, 'tool_calls') and response.tool_calls:
             _resp_tc = f' tool_calls=[{", ".join(tc["name"] for tc in response.tool_calls)}]'
-        print(f"[{_ts}] [LLM] invoke OK: {_resp_chars} chars{_resp_tc}", flush=True)
-        
+        print(f"[{_ts}] [LLM] stream OK: {_resp_chars} chars{_resp_tc}", flush=True)
         # ── 空回复处理（与 Hermes 对齐：信任 LLM 判断）──
         # Hermes 的做法：LLM 返回纯文本 → 直接返回，没有"空意图重试"。
         # 小模型可能"只说不做"，但强制重试往往让情况更糟。
@@ -250,24 +251,20 @@ def agent_node(state: AgentState, llm, cancel_event: threading.Event = None) -> 
                 retry_messages = full_messages + [response, HumanMessage(
                     content="[系统提示：你刚才没有给出任何回复，请重新回答用户的问题。如果需要查找信息，请直接调用工具。]"
                 )]
-                _retry_result = [None]
+                _retry_chunks = []
                 _retry_error = [None]
-                def _do_retry(_msgs=retry_messages):
-                    try:
-                        _retry_result[0] = llm.invoke(_msgs)
-                    except Exception as e:
-                        _retry_error[0] = e
-                _retry_thread = threading.Thread(target=_do_retry, daemon=True)
-                _retry_thread.start()
-                while _retry_thread.is_alive():
-                    if cancel_event and cancel_event.is_set():
-                        return {"messages": [AIMessage(content="(请求已取消)")]}
-                    _retry_thread.join(timeout=2)
-                if _retry_error[0]:
-                    print(f"[{_ts}] [EMPTY-INTENT] 重试失败: {str(_retry_error[0])[:200]}", flush=True)
-                else:
-                    response = _retry_result[0]
-                    print(f"[{_ts}] [EMPTY-INTENT] 重试成功: {len(str(response.content or ''))} chars", flush=True)
+                try:
+                    for chunk in llm.stream(retry_messages):
+                        if cancel_event and cancel_event.is_set():
+                            return {"messages": [AIMessage(content="(请求已取消)")]}
+                        _retry_chunks.append(chunk)
+                    if _retry_chunks:
+                        response = _retry_chunks[0]
+                        for c in _retry_chunks[1:]:
+                            response = response + c
+                        print(f"[{_ts}] [EMPTY-INTENT] 重试成功: {len(str(response.content or ''))} chars", flush=True)
+                except Exception as se:
+                    print(f"[{_ts}] [EMPTY-INTENT] 重试失败: {str(se)[:200]}", flush=True)
     except Exception as e:
         import traceback as _tb
         _error_full = str(e)

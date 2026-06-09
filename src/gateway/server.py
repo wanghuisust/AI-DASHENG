@@ -118,117 +118,151 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
     cancel_event: 如果被 set，中止 SSE 读取
     on_status: 回调函数 on_status(step, data)，收到 status 事件时调用，用于实时推送进度
     """
+    import httpx
     url = f"{DASHENG_API}/v1/chat/stream"
-    payload = json.dumps({
+    payload = {
         "message": message.text,
         "thread_id": message.chat_id,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    }
 
     try:
-        resp = urllib.request.urlopen(req, timeout=1800)
-        # 记录 resp 到 active_requests，以便取消时关闭
-        with _active_requests_lock:
-            entry = _active_requests.get(message.chat_id)
-            if entry:
-                entry["sse_resp"] = resp
-        response_text = ""
-        logger.debug(f"[SSE] Connected to {url}, reading events...")
-        for line_bytes in resp:
-            # 检查是否被取消
-            if cancel_event and cancel_event.is_set():
-                logger.info(f"[SSE] 请求被取消，停止读取 (chat_id={message.chat_id})")
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                return ""
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            if line.startswith(": "):
-                logger.debug(f"[SSE] keepalive")
-                continue
-            if line.startswith("event: "):
-                event_type = line[7:]
-                logger.debug(f"[SSE] event: {event_type}")
-            elif line.startswith("data: "):
-                data_str = line[6:]
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    logger.debug(f"[SSE] non-json data: {data_str[:100]}")
-                    continue
+        with httpx.Client(timeout=httpx.Timeout(1800.0, connect=10.0)) as client:
+            with client.stream("POST", url, json=payload) as resp:
+                # 记录 resp 到 active_requests，以便取消时关闭
+                with _active_requests_lock:
+                    entry = _active_requests.get(message.chat_id)
+                    if entry:
+                        entry["sse_resp"] = resp
 
-                logger.debug(f"[SSE] {event_type}: {json.dumps(data, ensure_ascii=False)[:200]}")
+                response_text = ""
+                logger.debug(f"[SSE] Connected to {url}, reading events...")
+                event_type = ""
+                for line_bytes in resp.iter_lines():
+                    # 检查是否被取消
+                    if cancel_event and cancel_event.is_set():
+                        logger.info(f"[SSE] 请求被取消，停止读取 (chat_id={message.chat_id})")
+                        return ""
 
-                if event_type == "status":
-                    step = data.get("step", "")
-                    msg = data.get("message", "")
-                    content = data.get("content", "")
-                    tool = data.get("tool", "")
-                    with status_lock:
-                        if step == "thinking":
-                            current_status["message"] = content[:80] if content else "🤔 正在思考..."
-                        elif step == "reasoning":
-                            # 推理内容可能很长，只取前50字
-                            short = content[:50] + ("..." if len(content) > 50 else "")
-                            current_status["message"] = f"💭 推理中: {short}"
-                        elif step == "tool_call":
-                            _args = data.get("args", {})
-                            _action = {
-                                "terminal_execute": "执行命令", "search_files": "搜索文件",
-                                "read_file": "读取文件", "write_file": "写入文件",
-                                "patch": "编辑文件", "web_search": "搜索网页",
-                            }.get(tool, tool)
-                            _preview = ""
-                            if _args:
-                                for k in ("command", "pattern", "path", "query", "text", "name"):
-                                    v = _args.get(k, "")
-                                    if isinstance(v, str) and v:
-                                        _preview = f"：\"{v[:30]}\""
-                                        break
-                            current_status["message"] = f"⚙️ {_action}{_preview}…"
-                        elif step == "tool_done":
-                            current_status["message"] = f"▶️ 继续下一步…"
-                        current_status["step"] = step
-                    # 回调：实时推送进度给客户端
-                    if on_status:
+                    line = line_bytes.decode("utf-8", errors="replace").strip() if isinstance(line_bytes, bytes) else line_bytes.strip()
+                    if not line:
+                        continue
+                    if line.startswith("event: "):
+                        event_type = line[7:]
+                        logger.debug(f"[SSE] event: {event_type}")
+                    elif line.startswith("data: "):
+                        data_str = line[6:]
+                        if not data_str:
+                            continue
                         try:
-                            on_status(step, data)
-                        except Exception as e:
-                            logger.warning(f"[on_status] 回调异常: {e}")
-                elif event_type == "result":
-                    response_text = data.get("response", "")
-                    # 收到最终回复，清掉 thinking 类的 pending steps（避免和 result 内容重复）
-                    if on_status:
-                        try:
-                            on_status("final_result", data)
-                        except Exception:
-                            pass
-                    # result 是最终回复，收到后立即跳出，不再等 SSE EOF
-                    break
-                elif event_type == "done":
-                    # 服务端显式结束标记
-                    break
-                elif event_type == "error":
-                    logger.error(f"[Agent SSE] 错误: {data.get('message', '')}")
-                    response_text = f"抱歉，处理消息时出错: {data.get('message', '')}"
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            logger.debug(f"[SSE] non-json data: {data_str[:100]}")
+                            continue
+
+                        logger.debug(f"[SSE] {event_type}: {json.dumps(data, ensure_ascii=False)[:200]}")
+
+                        if event_type == "text_delta":
+                            # 逐 token 增量，拼接到 response_text
+                            delta = data.get("delta", "")
+                            full_so_far = data.get("text", "")
+                            response_text += delta
+                            # 回调给微信增量推送
+                            if on_status:
+                                try:
+                                    on_status("streaming_text", {"delta": delta, "text": full_so_far})
+                                except Exception as e:
+                                    logger.warning(f"[on_status] streaming_text 回调异常: {e}")
+                        elif event_type == "status":
+                            step = data.get("step", "")
+                            msg = data.get("message", "")
+                            content = data.get("content", "")
+                            tool = data.get("tool", "")
+                            with status_lock:
+                                if step == "thinking":
+                                    current_status["message"] = content[:80] if content else "🤔 正在思考..."
+                                elif step == "reasoning":
+                                    short = content[:50] + ("..." if len(content) > 50 else "")
+                                    current_status["message"] = f"💭 推理中: {short}"
+                                elif step == "tool_call":
+                                    _args = data.get("args", {})
+                                    _action = {
+                                        "terminal_execute": "执行命令", "search_files": "搜索文件",
+                                        "read_file": "读取文件", "write_file": "写入文件",
+                                        "patch": "编辑文件", "web_search": "搜索网页",
+                                    }.get(tool, tool)
+                                    _preview = ""
+                                    if _args:
+                                        for k in ("command", "pattern", "path", "query", "text", "name"):
+                                            v = _args.get(k, "")
+                                            if isinstance(v, str) and v:
+                                                _preview = f"：\"{v[:30]}\""
+                                                break
+                                    current_status["message"] = f"⚙️ {_action}{_preview}…"
+                                elif step == "tool_done":
+                                    current_status["message"] = f"▶️ 继续下一步…"
+                                current_status["step"] = step
+                            # 回调：实时推送进度给客户端
+                            if on_status:
+                                try:
+                                    on_status(step, data)
+                                except Exception as e:
+                                    logger.warning(f"[on_status] 回调异常: {e}")
+                        elif event_type == "tool_started":
+                            # 独立事件：工具开始执行，映射到 tool_call 步骤
+                            tool = data.get("tool", "")
+                            with status_lock:
+                                _args = data.get("args", {})
+                                _action = {
+                                    "terminal_execute": "执行命令", "search_files": "搜索文件",
+                                    "read_file": "读取文件", "write_file": "写入文件",
+                                    "patch": "编辑文件", "web_search": "搜索网页",
+                                }.get(tool, tool)
+                                current_status["message"] = f"⚙️ {_action}…"
+                                current_status["step"] = "tool_call"
+                            if on_status:
+                                try:
+                                    on_status("tool_call", data)
+                                except Exception as e:
+                                    logger.warning(f"[on_status] tool_call 回调异常: {e}")
+                        elif event_type == "tool_done":
+                            # 独立事件：工具执行完毕
+                            with status_lock:
+                                current_status["message"] = "▶️ 继续下一步…"
+                                current_status["step"] = "tool_done"
+                            if on_status:
+                                try:
+                                    on_status("tool_done", data)
+                                except Exception as e:
+                                    logger.warning(f"[on_status] tool_done 回调异常: {e}")
+                        elif event_type == "result":
+                            response_text = data.get("response", "")
+                            # 收到最终回复，清掉 thinking 类的 pending steps
+                            if on_status:
+                                try:
+                                    on_status("final_result", data)
+                                except Exception:
+                                    pass
+                            # result 是最终回复，收到后立即跳出
+                            break
+                        elif event_type == "done":
+                            # 服务端显式结束标记
+                            break
+                        elif event_type == "error":
+                            logger.error(f"[Agent SSE] 错误: {data.get('message', '')}")
+                            response_text = f"抱歉，处理消息时出错: {data.get('message', '')}"
         return response_text
-    except urllib.error.HTTPError as e:
+    except httpx.TimeoutException:
+        logger.error(f"[Agent SSE] 连接超时: {url}")
+        return "抱歉，Agent 服务暂时不可用，请稍后再试。"
+    except httpx.HTTPStatusError as e:
         try:
-            err_body = e.read().decode("utf-8", errors="replace")
-            logger.error(f"[Agent SSE] HTTP {e.code}: {err_body[:200]}")
+            err_body = e.response.text[:200] if e.response else ""
+            logger.error(f"[Agent SSE] HTTP {e.response.status_code}: {err_body}")
         except Exception:
-            logger.error(f"[Agent SSE] HTTP {e.code}")
-        return f"抱歉，处理消息时出错(HTTP {e.code})"
-    except urllib.error.URLError as e:
-        logger.error(f"[Agent SSE] 连接失败: {e.reason}")
+            logger.error(f"[Agent SSE] HTTP {e.response.status_code}")
+        return f"抱歉，处理消息时出错(HTTP {e.response.status_code})"
+    except httpx.ConnectError:
+        logger.error(f"[Agent SSE] 连接失败: {url}")
         return "抱歉，Agent 服务暂时不可用，请稍后再试。"
     except Exception as e:
         logger.error(f"[Agent SSE] 流式调用异常: {e}")
@@ -355,6 +389,7 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                     text=text,
                     is_group=message.is_group,
                     at_user=message.user_id,
+                    raw={"is_progress": True},
                 )
                 qq_adapter.send_reply(progress_reply)
                 logger.info(f"[QQ] 进度消息 #{count}: {step_text}")
@@ -370,6 +405,12 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         _pending_steps = []              # 待发送的步骤
         _last_flush_time = [0.0]         # 上次发送时间
         _flush_timer = [None]            # 定时器
+
+        # ── 微信增量推送状态 ──
+        _streaming_text_sent = [0]       # 已推送的文本字符数
+        _streaming_last_push = [0.0]     # 上次推送时间戳
+        STREAMING_PUSH_MIN_CHARS = 150   # 最少累积 150 字才推
+        STREAMING_PUSH_MIN_INTERVAL = 4.0  # 两次推送最少间隔 4 秒
 
         # ── 工具自然语言描述映射（Hermes 风格：半思考半行动）──
         _TOOL_ACTION = {
@@ -486,6 +527,7 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                     text=text,
                     is_group=message.is_group,
                     at_user=message.user_id,
+                    raw={"is_progress": True},
                 )
                 _wechat.send_reply(progress_reply)
             except Exception as e:
@@ -509,6 +551,51 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                 # 如果还有 tool 步骤没发，立即 flush
                 if _pending_steps:
                     _flush_progress()
+                # 推送 streaming 尾部文本（最后一段可能不够 150 字但也是有效输出）
+                # 注意：result 事件包含完整回复，微信最终会再发一次完整消息
+                # 这里只推送 streaming 期间漏掉的尾部，避免用户看到断档
+                # 但如果 streaming 推送总量已经覆盖了回复主体，最终回复可以跳过（在下面处理）
+                return
+
+            # ── streaming_text：LLM 逐 token 输出，增量推送给微信 ──
+            if step == "streaming_text":
+                full_text = data.get("text", "")
+                if not full_text:
+                    return
+                sent = _streaming_text_sent[0]
+                new_chars = len(full_text) - sent
+                elapsed = now - _streaming_last_push[0]
+                # 条件1: 新增字符足够多（>=150字）
+                # 条件2: 距上次推送已过 4 秒（避免频率过高被限流）
+                should_push = new_chars >= STREAMING_PUSH_MIN_CHARS and elapsed >= STREAMING_PUSH_MIN_INTERVAL
+                # 在句号/换行处优先切割（避免断句）
+                if should_push and new_chars > 0:
+                    # 找最近的一个句子结束点（句号、问号、叹号、换行）
+                    cut_pos = len(full_text)
+                    # 从 sent + STREAMING_PUSH_MIN_CHARS 开始往前找断句点
+                    search_start = min(sent + STREAMING_PUSH_MIN_CHARS, len(full_text))
+                    for i in range(search_start, min(search_start + 50, len(full_text))):
+                        if full_text[i] in "。！？\n":
+                            cut_pos = i + 1
+                            break
+                    # 提取新片段
+                    chunk_text = full_text[sent:cut_pos].strip()
+                    if chunk_text:
+                        try:
+                            reply = PlatformReply(
+                                platform="wechat",
+                                chat_id=message.chat_id,
+                                text=chunk_text,
+                                is_group=message.is_group,
+                                at_user=message.user_id,
+                                raw={"is_progress": True, "is_streaming": True},
+                            )
+                            _wechat.send_reply(reply)
+                            _streaming_text_sent[0] = cut_pos
+                            _streaming_last_push[0] = now
+                            logger.debug(f"[wechat-streaming] 推送 {len(chunk_text)} 字, 累计 {cut_pos}/{len(full_text)}")
+                        except Exception as e:
+                            logger.warning(f"[wechat-streaming] 推送失败: {e}")
                 return
 
             # ── 构造步骤条目 ──
@@ -593,10 +680,34 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         )
 
         if message.platform == "wechat" and _wechat:
-            try:
-                _wechat.send_reply(reply)
-            except Exception as e:
-                logger.error(f"微信发送回复异常: {e}")
+            # 微信 streaming 增量推送：如果已经推送了回复主体，跳过最终完整消息
+            # 判断标准：streaming 已推送量 >= 回复文本的 80%
+            streaming_sent = _streaming_text_sent[0]
+            if streaming_sent > 0 and streaming_sent >= len(reply_text) * 0.8:
+                # 推送剩余的尾部文本（不够 150 字阈值的那部分）
+                remaining = reply_text[streaming_sent:].strip()
+                if remaining:
+                    try:
+                        tail_reply = PlatformReply(
+                            platform="wechat",
+                            chat_id=message.chat_id,
+                            text=remaining,
+                            is_group=message.is_group,
+                            at_user=message.user_id,
+                            raw={"is_progress": True, "is_streaming": True},
+                        )
+                        _wechat.send_reply(tail_reply)
+                        logger.info(f"[wechat-streaming] 推送尾部 {len(remaining)} 字（streaming 已推送 {streaming_sent}/{len(reply_text)}）")
+                    except Exception as e:
+                        logger.warning(f"[wechat-streaming] 尾部推送失败: {e}")
+                else:
+                    logger.info(f"[wechat-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
+            else:
+                # streaming 推送量不足（可能回复很短、或 LLM 没走 streaming 路径），发完整消息
+                try:
+                    _wechat.send_reply(reply)
+                except Exception as e:
+                    logger.error(f"微信发送回复异常: {e}")
         elif message.platform == "qq":
             try:
                 qq_adapter.send_reply(reply)

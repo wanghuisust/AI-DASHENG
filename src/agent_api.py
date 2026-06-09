@@ -507,7 +507,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json({"error": err_str}, 500)
 
-    # ── SSE 流式对话 ─────────────────────────────────────
+    # ── SSE 流式对话（v2: astream_events 逐 token 推送）─────────
 
     def _handle_stream_chat(self):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -580,141 +580,192 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 import datetime as _dt
                 _ts = _dt.datetime.now().strftime("%H:%M:%S")
                 print(f"[{_ts}] [STREAM] thread={thread_id} history={prev_count} msgs, new msg={user_msg[:80]}", flush=True)
-                sse_send("status", {"step": "thinking", "message": "正在思考..."})
 
-                all_new_messages = []
-                tool_calls_seen = set()
+                # ── 构建带 cancel_event 的 graph 实例 ──
+                _cancelable_graph = build_graph(cancel_event=_local_cancel)
 
-                # 用队列+线程 流式处理，边产边消费，不堆积全部 event 在内存
-                import queue
-                _event_queue = queue.Queue(maxsize=32)  # 限制队列大小，backpressure
+                # ── 用队列桥接 async astream_events → 同步 SSE 发送 ──
+                import queue as _queue_mod
+                _event_queue = _queue_mod.Queue(maxsize=256)
                 _stream_error = [None]
                 _stream_done = [False]
 
-                # 每次请求构建带 cancel_event 的 graph 实例，以便 LLM invoke 期间可被取消
-                _cancelable_graph = build_graph(cancel_event=_local_cancel)
+                # 追踪 LLM 输出：每轮 agent 节点的完整文本/工具调用
+                _current_llm_text = [""]      # 当前 LLM 轮次的累积文本
+                _current_tool_calls = [None]  # 当前 LLM 轮次的 tool_calls
+                all_new_messages = []
+                tool_calls_seen = set()
 
-                def _run_stream():
+                def _run_astream():
+                    """在新线程中运行 asyncio 事件循环，消费 astream_events v2"""
+                    import asyncio
+
+                    async def _astream():
+                        try:
+                            async for event in _cancelable_graph.astream_events(
+                                {"messages": messages},
+                                version="v2",
+                                config={"recursion_limit": 40},
+                            ):
+                                if _local_cancel.is_set() or _stream_done[0]:
+                                    break
+                                _event_queue.put(event, timeout=1800)
+                        except Exception as e:
+                            # GraphRecursionError: 达到 recursion_limit，尝试总结
+                            if "recursion" in str(e).lower() or "RecursionError" in type(e).__name__:
+                                print(f"[STREAM-RECURSION-LIMIT] 达到迭代上限，尝试无工具总结", flush=True)
+                                try:
+                                    summary = _summarize_without_tools(messages)
+                                    _event_queue.put({
+                                        "event": "on_chain_end",
+                                        "name": "LangGraph",
+                                        "data": {"output": {"messages": messages + [AIMessage(content=summary)]}},
+                                    }, timeout=60)
+                                except Exception as se:
+                                    print(f"[STREAM-RECURSION-LIMIT] 总结失败: {se}", flush=True)
+                                    _event_queue.put({
+                                        "event": "on_chain_end",
+                                        "name": "LangGraph",
+                                        "data": {"output": {"messages": messages + [AIMessage(content="抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。")]}},
+                                    }, timeout=60)
+                            else:
+                                _stream_error[0] = e
+                        finally:
+                            _event_queue.put(None)  # sentinel
+
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     try:
-                        _step = 0
-                        for event in _cancelable_graph.stream(
-                            {"messages": messages},
-                            config={"recursion_limit": 40},
-                        ):
-                            _step += 1
-                            _nodes = list(event.keys())
-                            print(f"[STREAM-EVENT] step={_step} nodes={_nodes}", flush=True)
-                            for _nk, _nv in event.items():
-                                if _nk == "agent":
-                                    _msgs = _nv.get("messages", [])
-                                    for _m in _msgs:
-                                        _tc = ""
-                                        if hasattr(_m, "tool_calls") and _m.tool_calls:
-                                            _tc = f" tool_calls=[{', '.join(tc['name'] for tc in _m.tool_calls)}]"
-                                        _c = str(_m.content)[:80] if _m.content else "(empty)"
-                                        print(f"  [STREAM-EVENT] agent: type={_m.type} content={_c}{_tc}", flush=True)
-                                elif _nk == "tools":
-                                    _msgs = _nv.get("messages", [])
-                                    for _m in _msgs:
-                                        _c = str(_m.content)[:80] if _m.content else "(empty)"
-                                        print(f"  [STREAM-EVENT] tools: type={_m.type} content={_c}", flush=True)
-                            if _stream_done[0] or _local_cancel.is_set():  # 被超时/取消终止
-                                break
-                            _event_queue.put(event, timeout=1800)
-                    except Exception as e:
-                        print(f"[STREAM-EVENT] ERROR: {type(e).__name__}: {str(e)[:300]}", flush=True)
-                        # GraphRecursionError: 达到 recursion_limit，尝试总结
-                        if "recursion" in str(e).lower() or "RecursionError" in type(e).__name__:
-                            print(f"[STREAM-RECURSION-LIMIT] 达到迭代上限，尝试无工具总结", flush=True)
-                            try:
-                                summary = _summarize_without_tools(messages)
-                                # 把总结作为一个特殊的 agent event 注入队列
-                                _event_queue.put({"agent": {"messages": [AIMessage(content=summary)]}}, timeout=60)
-                            except Exception as se:
-                                print(f"[STREAM-RECURSION-LIMIT] 总结失败: {se}", flush=True)
-                                _event_queue.put({"agent": {"messages": [AIMessage(content="抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。")]}}, timeout=60)
-                        else:
-                            _stream_error[0] = e
+                        loop.run_until_complete(_astream())
                     finally:
-                        print(f"[STREAM-EVENT] DONE, total_steps={_step}", flush=True)
-                        _event_queue.put(None)  # sentinel
+                        loop.close()
 
-                _st = threading.Thread(target=_run_stream, daemon=True)
+                _st = threading.Thread(target=_run_astream, daemon=True)
                 _st.start()
 
-                # 消费 event 队列，边收边处理，不堆积
+                # ── 消费事件队列，逐事件转 SSE ──
                 timeout_seconds = 1800
+                graph_finished = False
+
                 while True:
                     # 检查是否被取消
                     if _local_cancel.is_set():
                         _stream_done[0] = True
-                        logger.info(f"[STREAM] 请求被取消 thread={thread_id}")
                         sse_send("status", {"step": "cancelled", "message": "请求已取消"})
                         break
+
                     try:
                         event = _event_queue.get(timeout=5)  # 短轮询，快速响应 cancel
-                    except queue.Empty:
+                    except _queue_mod.Empty:
                         timeout_seconds -= 5
                         if timeout_seconds <= 0:
-                            # 总超时 1800s
                             _stream_done[0] = True
                             sse_send("error", {"message": "处理超时，请稍后重试"})
                             self.close_connection = True
                             return
-                        continue  # 未超时，继续轮询
+                        continue
 
                     if event is None:  # sentinel — 流结束
                         break
+                    event_kind = event.get("event", "")
+                    event_name = event.get("name", "")
+                    event_data = event.get("data", {})
+                    # ── on_chat_model_stream：逐 token 推送 text_delta ──
+                    if event_kind == "on_chat_model_stream":
+                        chunk = event_data.get("chunk")
+                        if chunk and hasattr(chunk, "content") and chunk.content:
+                            content = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                            _current_llm_text[0] += content
+                            sse_send("text_delta", {
+                                "delta": content,
+                                "text": _current_llm_text[0],
+                            })
+                        # tool_call_chunks：流式工具调用名称/参数
+                        if chunk and hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                            for tc_chunk in chunk.tool_call_chunks:
+                                tc_name = tc_chunk.get("name", "")
+                                if tc_name:
+                                    # 只在名称首次出现时推送
+                                    pass  # tool_call 在 on_chat_model_end 时统一推送
 
-                    for node_name, node_output in event.items():
-                        if node_name == "agent":
-                            msgs = node_output.get("messages", [])
-                            for msg in msgs:
-                                all_new_messages.append(msg)
-                                if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
-                                    reasoning = msg.additional_kwargs.get("reasoning_content", "") or \
-                                                msg.additional_kwargs.get("reasoning", "")
-                                    if reasoning:
-                                        sse_send("status", {
-                                            "step": "reasoning",
-                                            "content": reasoning,
-                                        })
-                                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                    for tc in msg.tool_calls:
-                                        tc_id = tc.get("id", "")
-                                        if tc_id not in tool_calls_seen:
-                                            tool_calls_seen.add(tc_id)
-                                            sse_send("status", {
-                                                "step": "tool_call",
-                                                "tool": tc["name"],
-                                                "args": tc.get("args", {}),
-                                                "message": f"正在调用 {tc['name']}...",
-                                            })
-                                elif msg.content and isinstance(msg.content, str) and msg.content.strip():
-                                    # AI 有思考内容但没有 tool_calls → 推送思考文本
-                                    # 类似 Hermes 的"thinking aloud"效果
+                    # ── on_chat_model_end：LLM 一轮输出完毕 ──
+                    elif event_kind == "on_chat_model_end":
+                        output = event_data.get("output")
+                        if output:
+                            # 推送 reasoning_content（思考链）
+                            if hasattr(output, "additional_kwargs") and output.additional_kwargs:
+                                reasoning = output.additional_kwargs.get("reasoning_content", "") or \
+                                            output.additional_kwargs.get("reasoning", "")
+                                if reasoning:
                                     sse_send("status", {
-                                        "step": "thinking",
-                                        "content": msg.content.strip(),
+                                        "step": "reasoning",
+                                        "content": reasoning,
                                     })
-                        elif node_name == "tools":
-                            msgs = node_output.get("messages", [])
-                            for msg in msgs:
-                                all_new_messages.append(msg)
-                                tool_name = getattr(msg, "name", "未知工具")
-                                # 工具结果内容，截断到 200 字用于进度展示
-                                tool_content = ""
-                                if msg.content:
-                                    tool_content = str(msg.content)[:200]
+
+                            # 推送 tool_calls（如果 LLM 决定调用工具）
+                            if hasattr(output, "tool_calls") and output.tool_calls:
+                                _current_tool_calls[0] = output.tool_calls
+                                for tc in output.tool_calls:
+                                    tc_id = tc.get("id", "")
+                                    if tc_id not in tool_calls_seen:
+                                        tool_calls_seen.add(tc_id)
+                                        sse_send("tool_call", {
+                                            "tool": tc["name"],
+                                            "args": tc.get("args", {}),
+                                            "message": f"正在调用 {tc['name']}...",
+                                        })
+
+                            # 如果 LLM 有纯文本且无 tool_calls，推送 thinking
+                            elif _current_llm_text[0].strip():
                                 sse_send("status", {
-                                    "step": "tool_done",
-                                    "tool": tool_name,
-                                    "message": f"{tool_name} 执行完成",
-                                    "content": tool_content,
+                                    "step": "thinking",
+                                    "content": _current_llm_text[0].strip(),
                                 })
+
+                        # 重置本轮 LLM 追踪
+                        _current_llm_text[0] = ""
+                        _current_tool_calls[0] = None
+
+                    # ── on_tool_start：工具开始执行 ──
+                    elif event_kind == "on_tool_start":
+                        tool_name = event_name
+                        tool_input = event_data.get("input", {})
+                        sse_send("tool_started", {
+                            "tool": tool_name,
+                            "args": tool_input if isinstance(tool_input, dict) else str(tool_input),
+                            "message": f"正在执行 {tool_name}...",
+                        })
+
+                    # ── on_tool_end：工具执行完毕 ──
+                    elif event_kind == "on_tool_end":
+                        tool_name = event_name
+                        tool_output = event_data.get("output", "")
+                        # 截断到 200 字用于进度展示
+                        tool_content = str(tool_output)[:200] if tool_output else ""
+                        sse_send("tool_done", {
+                            "tool": tool_name,
+                            "message": f"{tool_name} 执行完成",
+                            "content": tool_content,
+                        })
+
+                    # ── on_chain_end (LangGraph)：图执行完毕 ──
+                    elif event_kind == "on_chain_end" and event_name == "LangGraph":
+                        graph_finished = True
+                        output = event_data.get("output", {})
+                        if output and "messages" in output:
+                            result_messages = output["messages"]
+                            all_new_messages = result_messages[prev_count:]
 
                 if _stream_error[0]:
                     raise _stream_error[0]
+
+                # ── 最终结果 ──
+                if not all_new_messages and _current_llm_text[0].strip():
+                    # graph 没走完但 LLM 有输出文本（异常中断），用累积文本兜底
+                    all_new_messages = [AIMessage(content=_current_llm_text[0].strip())]
+                elif not all_new_messages and graph_finished:
+                    # graph 走完但没有消息——理论上不应该发生
+                    logger.warning(f"[STREAM] graph_finished=True 但 all_new_messages 为空")
 
                 result_messages = messages + all_new_messages
                 thread_messages[thread_id] = result_messages
@@ -722,7 +773,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
                 response_text, tool_calls_info = extract_response(result_messages, prev_count)
 
-                # ── 空意图检测：回复只有意图声明没有实际内容时，自动用无工具 LLM 总结 ──
+                # ── 空意图检测 ──
                 response_text = _fix_empty_intent_response(response_text, result_messages)
 
                 sse_send("result", {
@@ -730,11 +781,14 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     "tool_calls": tool_calls_info if tool_calls_info else None,
                     "thread_id": thread_id,
                 })
-                sse_send("done", {})  # 显式结束标记，让 gateway 立即断开
+                sse_send("done", {})  # 显式结束标记
                 self.close_connection = True
             finally:
                 release_thread_lock(thread_id)
         except Exception as e:
+            import traceback as _tb
+            print(f"[STREAM] ERROR: {type(e).__name__}: {str(e)[:500]}", flush=True)
+            _tb.print_exc()
             sse_send("error", {"message": str(e)})
         finally:
             _stop_keepalive.set()

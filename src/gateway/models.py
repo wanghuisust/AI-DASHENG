@@ -22,12 +22,13 @@ class PlatformMessage:
 
 class PlatformReply:
     """跨平台统一回复"""
-    __slots__ = ("chat_id", "text", "platform", "is_group", "at_user")
+    __slots__ = ("chat_id", "text", "platform", "is_group", "at_user", "raw")
 
     def __init__(self, chat_id: str, text: str, platform: str,
-                 is_group: bool = False, at_user: str = ""):
+                 is_group: bool = False, at_user: str = "", raw: dict = None):
         self.chat_id = chat_id
         self.text = text
         self.platform = platform
         self.is_group = is_group
         self.at_user = at_user
+        self.raw = raw or {}
