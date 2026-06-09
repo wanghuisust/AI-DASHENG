@@ -36,6 +36,7 @@ load_dotenv(env_path, override=True)
 from graph import build_graph
 from persistence import get_store
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 # ── 请求取消机制 ──────────────────────────────────────────────
 # thread_id → Event：当 set 时，对应的流式请求应停止
@@ -273,8 +274,18 @@ def _summarize_without_tools(messages: list) -> str:
     
     # 创建短超时 LLM 实例（30s），防止无工具总结卡住
     from graph import create_llm
-    llm_short = create_llm()
-    llm_short.request_timeout = 30
+    import os
+    from dotenv import load_dotenv
+    from pathlib import Path
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(_env_path, override=True)
+    llm_short = ChatOpenAI(
+        model=os.getenv("MODEL_NAME", "gpt-4o-mini"),
+        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0.3,
+        request_timeout=30,
+    )
     
     try:
         response = llm_short.invoke(summary_messages)
