@@ -136,19 +136,31 @@ class SkillManager:
         self._load_all()
 
     def _load_all(self):
-        """加载所有技能"""
+        """加载所有技能（递归扫描子目录，支持分组目录如 github/）"""
         self.skills.clear()
         if not self.skills_dir.exists():
             self.skills_dir.mkdir(parents=True, exist_ok=True)
             return
 
-        for d in sorted(self.skills_dir.iterdir()):
-            if d.is_dir() and (d / "SKILL.md").exists():
+        self._scan_dir(self.skills_dir)
+
+    def _scan_dir(self, directory: Path):
+        """递归扫描目录，找到所有 SKILL.md"""
+        for d in sorted(directory.iterdir()):
+            if not d.is_dir():
+                continue
+            # 直接包含 SKILL.md → 是技能目录
+            if (d / "SKILL.md").exists():
                 try:
                     skill = Skill(d)
                     self.skills[skill.name] = skill
                 except Exception as e:
                     logger.warning(f"加载技能 {d.name} 失败: {e}")
+            else:
+                # 不含 SKILL.md → 可能是分组目录，递归扫描
+                sub_dirs = [sub for sub in d.iterdir() if sub.is_dir()]
+                if sub_dirs:
+                    self._scan_dir(d)
 
     def reload(self):
         """重新加载所有技能（安装/删除后调用）"""
@@ -236,18 +248,27 @@ triggers: [{', '.join(triggers)}]
             req = urllib.request.Request(url, method="GET")
             req.add_header("Accept", "application/json")
 
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            # 尝试直连，失败则走代理
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError):
+                # ClawHub 不可达，尝试走代理
+                proxy_url = os.getenv("HTTP_PROXY", "http://127.0.0.1:7897")
+                proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                opener = urllib.request.build_opener(proxy_handler)
+                with opener.open(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
             # 下载到本地
             return self._install_from_data(skill_name, data)
 
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                return {"status": "error", "message": f"ClawHub 上未找到技能 '{skill_name}'", "skill": skill_name}
-            return {"status": "error", "message": f"ClawHub 请求失败 (HTTP {e.code})", "skill": skill_name}
+                return {"status": "error", "message": f"ClawHub 上未找到技能 '{skill_name}'。提示：可以用 skill_install(source='GitHub URL') 从 GitHub 安装", "skill": skill_name}
+            return {"status": "error", "message": f"ClawHub 请求失败 (HTTP {e.code})。提示：可以用 skill_install(source='GitHub URL') 从 GitHub 安装", "skill": skill_name}
         except Exception as e:
-            return {"status": "error", "message": f"安装失败: {e}", "skill": skill_name}
+            return {"status": "error", "message": f"ClawHub 安装失败: {e}。提示：可以用 skill_install(source='GitHub URL') 从 GitHub 安装", "skill": skill_name}
 
     def install_from_github(self, repo_url: str, skill_path: str = "") -> dict:
         """从 GitHub 仓库安装技能
@@ -299,14 +320,21 @@ triggers: [{', '.join(triggers)}]
             return {"status": "error", "message": f"GitHub 安装失败: {e}", "skill": ""}
 
     def search_clawhub(self, query: str, limit: int = 10) -> list[dict]:
-        """搜索 ClawHub 技能"""
+        """搜索 ClawHub 技能库（不可达时返回空列表）"""
         try:
             url = f"{CLAWHUB_API}/v1/search?q={urllib.parse.quote(query)}&limit={limit}"
             req = urllib.request.Request(url, method="GET")
             req.add_header("Accept", "application/json")
 
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError):
+                proxy_url = os.getenv("HTTP_PROXY", "http://127.0.0.1:7897")
+                proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                opener = urllib.request.build_opener(proxy_handler)
+                with opener.open(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
             return data.get("skills", data if isinstance(data, list) else [])
 
@@ -337,6 +365,7 @@ triggers: [{', '.join(triggers)}]
 
     def _github_raw_url(self, owner: str, repo: str, path: str, branch: str = "main") -> str:
         """构造 GitHub raw 下载 URL（走代理）"""
+        # gh-proxy.com 代理 raw.githubusercontent.com
         raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
         return GITHUB_PROXY + raw
 
@@ -345,22 +374,36 @@ triggers: [{', '.join(triggers)}]
         return f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
 
     def _fetch_url(self, url: str, timeout: int = 15) -> str | None:
-        """下载 URL 内容"""
+        """下载 URL 内容（直连失败则走代理）"""
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8", errors="replace")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except (urllib.error.URLError, TimeoutError):
+                proxy_url = os.getenv("HTTP_PROXY", "http://127.0.0.1:7897")
+                proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                opener = urllib.request.build_opener(proxy_handler)
+                with opener.open(req, timeout=timeout) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
         except Exception as e:
             logger.warning(f"下载失败 {url}: {e}")
             return None
 
     def _fetch_json(self, url: str, timeout: int = 15) -> dict | list | None:
-        """下载 JSON"""
+        """下载 JSON（直连失败则走代理）"""
         try:
             req = urllib.request.Request(url)
             req.add_header("Accept", "application/json")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError):
+                proxy_url = os.getenv("HTTP_PROXY", "http://127.0.0.1:7897")
+                proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                opener = urllib.request.build_opener(proxy_handler)
+                with opener.open(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             logger.warning(f"JSON 下载失败 {url}: {e}")
             return None

@@ -12,7 +12,13 @@ def skill_install(source: str, name: str = "") -> str:
             - ClawHub 技能名（如 "github-code-review"）：自动从 ClawHub 下载
             - GitHub URL（如 "https://github.com/user/repo"）：从 GitHub 仓库下载
             - GitHub 短格式（如 "user/repo"）：从 GitHub 仓库下载
+            - GitHub 子目录（如 "https://github.com/user/repo/tree/main/skills/github-auth"）：下载子目录
         name: 可选，自定义技能名（留空则从 SKILL.md 自动读取）
+
+    重要提示：
+        - 如果 ClawHub 不可达，会自动走代理重试
+        - 如果 ClawHub 上找不到，请尝试用 GitHub URL 安装
+        - 安装后技能会自动注入到 system prompt，下次对话生效
 
     Returns:
         安装结果信息
@@ -64,14 +70,14 @@ def skill_list() -> str:
 
 @tool
 def skill_search(query: str, limit: int = 10) -> str:
-    """搜索 ClawHub 技能库。
+    """搜索 ClawHub 技能库。如果 ClawHub 不可达，会返回空结果，请改用 GitHub 搜索。
 
     Args:
         query: 搜索关键词（如 "github", "deploy", "debug"）
         limit: 返回结果数量上限（默认 10）
 
     Returns:
-        搜索结果列表
+        搜索结果列表。如果为空，建议用 skill_install(source="GitHub URL") 直接安装
     """
     _sm = _get_skill_manager()
     if not _sm:
