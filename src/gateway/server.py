@@ -427,6 +427,75 @@ def _handle_slash_command(message: PlatformMessage, text: str):
             else:
                 reply(f"❌ 压缩失败：{result.get('message', '未知错误')}")
 
+        elif cmd == "/skills":
+            # 列出已安装技能
+            from skills import SkillManager
+            sm = SkillManager(os.path.join(os.path.dirname(__file__), "..", "..", "data", "skills"))
+            skills = sm.list_skills()
+            if not skills:
+                reply("📋 暂无已安装技能\n用 /skill install 技能名 安装\n用 /skill search 关键词 搜索 ClawHub")
+            else:
+                lines = ["📋 已安装技能："]
+                for s in skills:
+                    desc = s.get("description", "")
+                    lines.append(f"  • {s['name']} — {desc}")
+                lines.append(f"\n共 {len(skills)} 个技能")
+                reply("\n".join(lines))
+
+        elif cmd == "/skill":
+            if not args:
+                reply("🔧 技能管理命令：\n  /skills — 列出已安装技能\n  /skill install 技能名 — 从 ClawHub 安装\n  /skill install GitHub_URL — 从 GitHub 安装\n  /skill search 关键词 — 搜索 ClawHub\n  /skill remove 技能名 — 删除技能")
+            else:
+                # 解析子命令
+                parts = args.split(None, 1)
+                sub_cmd = parts[0].lower()
+                sub_args = parts[1] if len(parts) > 1 else ""
+
+                if sub_cmd == "install":
+                    if not sub_args:
+                        reply("❌ 请指定技能名或 GitHub URL\n例: /skill install github-code-review\n例: /skill install https://github.com/user/repo")
+                    else:
+                        from skills import SkillManager
+                        sm = SkillManager(os.path.join(os.path.dirname(__file__), "..", "..", "data", "skills"))
+                        # 判断来源
+                        if sub_args.startswith("http") or "/" in sub_args.split()[0]:
+                            result = sm.install_from_github(sub_args)
+                        else:
+                            result = sm.install_from_clawhub(sub_args)
+                        reply(result.get("message", str(result)))
+
+                elif sub_cmd == "search":
+                    if not sub_args:
+                        reply("❌ 请指定搜索关键词\n例: /skill search github")
+                    else:
+                        from skills import SkillManager
+                        sm = SkillManager(os.path.join(os.path.dirname(__file__), "..", "..", "data", "skills"))
+                        results = sm.search_clawhub(sub_args, limit=10)
+                        if not results:
+                            reply(f"🔍 未在 ClawHub 找到匹配 '{sub_args}' 的技能")
+                        else:
+                            lines = [f"🔍 ClawHub 搜索 '{sub_args}'："]
+                            for r in results[:10]:
+                                name = r.get("name", "?")
+                                desc = r.get("description", "")
+                                lines.append(f"  • {name} — {desc}")
+                            lines.append("\n用 /skill install 技能名 安装")
+                            reply("\n".join(lines))
+
+                elif sub_cmd == "remove":
+                    if not sub_args:
+                        reply("❌ 请指定技能名\n例: /skill remove python-debug")
+                    else:
+                        from skills import SkillManager
+                        sm = SkillManager(os.path.join(os.path.dirname(__file__), "..", "..", "data", "skills"))
+                        if sm.delete(sub_args):
+                            reply(f"✅ 已删除技能 '{sub_args}'")
+                        else:
+                            reply(f"❌ 技能 '{sub_args}' 不存在")
+
+                else:
+                    reply(f"❌ 未知的 skill 子命令: {sub_cmd}\n可用: install, search, remove")
+
         else:
             # 未知命令，不拦截——当普通消息处理
             # 取消同一 chat_id 的前一个请求
