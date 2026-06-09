@@ -189,6 +189,24 @@ def _ensure_message_role_continuity(messages: list) -> list:
         print(f"[MSG-FIX] Removing leading ToolMessage: {getattr(cleaned[0], 'name', '?')}", flush=True)
         cleaned.pop(0)
     
+    # 确保消息序列中有 human 消息（API 要求至少一条 user 消息）
+    has_human = any(hasattr(m, 'type') and m.type == 'human' for m in cleaned)
+    if not has_human and len(cleaned) >= 2:
+        # 找到第一条 system 之后的 system 消息（通常是摘要），改为 human
+        for i in range(1, len(cleaned)):
+            if hasattr(cleaned[i], 'type') and cleaned[i].type == 'system':
+                old_content = cleaned[i].content
+                # 将摘要 system 消息转为 human 消息
+                from langchain_core.messages import HumanMessage
+                cleaned[i] = HumanMessage(content=old_content)
+                print(f"[MSG-FIX] No human message found, converted summary system→human (idx={i})", flush=True)
+                break
+        else:
+            # 没有摘要 system，在第一条 system 后插入 dummy human
+            from langchain_core.messages import HumanMessage
+            cleaned.insert(1, HumanMessage(content="继续"))
+            print(f"[MSG-FIX] No human message found, inserted dummy '继续' at idx=1", flush=True)
+    
     return cleaned
 
 
