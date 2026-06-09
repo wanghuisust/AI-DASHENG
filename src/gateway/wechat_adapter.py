@@ -609,8 +609,9 @@ class WeChatAdapter:
                 msg["context_token"] = context_token
 
             try:
-                await _api_post(self._session, self._base_url, EP_SEND_MESSAGE,
+                result = await _api_post(self._session, self._base_url, EP_SEND_MESSAGE,
                                 {"msg": msg}, self._token, API_TIMEOUT_MS)
+                logger.info(f"微信发送成功: chunk={len(chunk)}字, user={to_user_id[:20]}")
             except Exception as e:
                 logger.error(f"微信发送失败: {e}")
                 return False

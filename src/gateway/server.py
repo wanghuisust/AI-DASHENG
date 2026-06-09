@@ -370,36 +370,8 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
 
         # ── 发送开始处理通知（如果取消了前一个，_cancel_active_request 已发过通知） ──
 
-        def _send_progress():
-            """每60s发一次进度消息，附带当前步骤状态"""
-            count = 0
-            while not progress_stop.wait(60):
-                if cancel_event.is_set():
-                    return  # 新请求到来，停止进度
-                count += 1
-                with status_lock:
-                    step_text = current_status.get("message", "")
-                if count <= 3:
-                    text = f"⏳ 正在处理，请稍候...（{count * 60}秒）\n{step_text}"
-                else:
-                    text = f"⏳ 正在处理，请稍候...（{count * 60}秒）\n{step_text}\n任务流程长，请等待"
-                progress_reply = PlatformReply(
-                    platform=message.platform,
-                    chat_id=message.chat_id,
-                    text=text,
-                    is_group=message.is_group,
-                    at_user=message.user_id,
-                    raw={"is_progress": True},
-                )
-                qq_adapter.send_reply(progress_reply)
-                logger.info(f"[QQ] 进度消息 #{count}: {step_text}")
-
-        progress_thread = None
-        if message.platform == "qq":
-            progress_thread = threading.Thread(target=_send_progress, daemon=True)
-            progress_thread.start()
-
-        # ── 实时进度推送回调（微信用） ──
+        # ── 实时进度推送回调（微信/QQ 通用） ──
+        _target = _wechat if message.platform == "wechat" else (qq_adapter if message.platform == "qq" else None)
         _progress_history = []           # 已推送的进度列表
         PROGRESS_FLUSH_INTERVAL = 5.0    # 合并发送间隔（秒）
         _pending_steps = []              # 待发送的步骤
@@ -519,23 +491,23 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                 return
 
             _progress_history.append(text)
-            logger.info(f"[wechat-progress] 合并发送: {text[:80]}")
+            logger.info(f"[{message.platform}-progress] 合并发送: {text[:80]}")
             try:
                 progress_reply = PlatformReply(
-                    platform="wechat",
+                    platform=message.platform,
                     chat_id=message.chat_id,
                     text=text,
                     is_group=message.is_group,
                     at_user=message.user_id,
                     raw={"is_progress": True},
                 )
-                _wechat.send_reply(progress_reply)
+                _target.send_reply(progress_reply)
             except Exception as e:
-                logger.warning(f"[wechat-progress] 发送失败: {e}")
+                logger.warning(f"[{message.platform}-progress] 发送失败: {e}")
 
         def _on_status(step: str, data: dict):
-            """SSE status 回调：攒步骤，定时合并推送给微信"""
-            if message.platform != "wechat" or not _wechat:
+            """SSE status 回调：攒步骤，定时合并推送给客户端（微信/QQ）"""
+            if not _target:
                 return
             if cancel_event.is_set():
                 return
@@ -557,7 +529,7 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                 # 但如果 streaming 推送总量已经覆盖了回复主体，最终回复可以跳过（在下面处理）
                 return
 
-            # ── streaming_text：LLM 逐 token 输出，增量推送给微信 ──
+            # ── streaming_text：LLM 逐 token 输出，增量推送给客户端 ──
             if step == "streaming_text":
                 full_text = data.get("text", "")
                 if not full_text:
@@ -583,19 +555,19 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                     if chunk_text:
                         try:
                             reply = PlatformReply(
-                                platform="wechat",
+                                platform=message.platform,
                                 chat_id=message.chat_id,
                                 text=chunk_text,
                                 is_group=message.is_group,
                                 at_user=message.user_id,
                                 raw={"is_progress": True, "is_streaming": True},
                             )
-                            _wechat.send_reply(reply)
+                            _target.send_reply(reply)
                             _streaming_text_sent[0] = cut_pos
                             _streaming_last_push[0] = now
-                            logger.debug(f"[wechat-streaming] 推送 {len(chunk_text)} 字, 累计 {cut_pos}/{len(full_text)}")
+                            logger.debug(f"[{message.platform}-streaming] 推送 {len(chunk_text)} 字, 累计 {cut_pos}/{len(full_text)}")
                         except Exception as e:
-                            logger.warning(f"[wechat-streaming] 推送失败: {e}")
+                            logger.warning(f"[{message.platform}-streaming] 推送失败: {e}")
                 return
 
             # ── 构造步骤条目 ──
@@ -652,10 +624,8 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         if _pending_steps:
             _flush_progress()
 
-        # ── 停止进度消息 & typing loop ──
-        progress_stop.set()  # 通知 typing loop 和 progress thread 停止
-        if progress_thread:
-            progress_thread.join(timeout=3)
+        # ── 停止 typing loop ──
+        progress_stop.set()  # 通知 typing loop 停止
         if wechat_typing_thread:
             wechat_typing_thread.join(timeout=3)
 
@@ -679,8 +649,8 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             at_user=message.user_id,
         )
 
-        if message.platform == "wechat" and _wechat:
-            # 微信 streaming 增量推送：如果已经推送了回复主体，跳过最终完整消息
+        if _target:
+            # streaming 增量推送：如果已经推送了回复主体，跳过最终完整消息
             # 判断标准：streaming 已推送量 >= 回复文本的 80%
             streaming_sent = _streaming_text_sent[0]
             if streaming_sent > 0 and streaming_sent >= len(reply_text) * 0.8:
@@ -689,34 +659,27 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                 if remaining:
                     try:
                         tail_reply = PlatformReply(
-                            platform="wechat",
+                            platform=message.platform,
                             chat_id=message.chat_id,
                             text=remaining,
                             is_group=message.is_group,
                             at_user=message.user_id,
                             raw={"is_progress": True, "is_streaming": True},
                         )
-                        _wechat.send_reply(tail_reply)
-                        logger.info(f"[wechat-streaming] 推送尾部 {len(remaining)} 字（streaming 已推送 {streaming_sent}/{len(reply_text)}）")
+                        _target.send_reply(tail_reply)
+                        logger.info(f"[{message.platform}-streaming] 推送尾部 {len(remaining)} 字（streaming 已推送 {streaming_sent}/{len(reply_text)}）")
                     except Exception as e:
-                        logger.warning(f"[wechat-streaming] 尾部推送失败: {e}")
+                        logger.warning(f"[{message.platform}-streaming] 尾部推送失败: {e}")
                 else:
-                    logger.info(f"[wechat-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
+                    logger.info(f"[{message.platform}-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
             else:
                 # streaming 推送量不足（可能回复很短、或 LLM 没走 streaming 路径），发完整消息
                 try:
-                    _wechat.send_reply(reply)
+                    _target.send_reply(reply)
                 except Exception as e:
-                    logger.error(f"微信发送回复异常: {e}")
-        elif message.platform == "qq":
-            try:
-                qq_adapter.send_reply(reply)
-            except Exception as e:
-                logger.error(f"QQ发送回复异常: {e}")
-        elif message.platform == "wechat":
-            logger.warning("微信消息但适配器未启动，无法回复")
+                    logger.error(f"{message.platform}发送回复异常: {e}")
         else:
-            logger.warning(f"未知平台: {message.platform}")
+            logger.warning(f"{message.platform}消息但适配器未启动，无法回复")
     except Exception as e:
         logger.error(f"[{message.platform}] 处理消息异常: {e}", exc_info=True)
     finally:

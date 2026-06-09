@@ -10,6 +10,6 @@ ws.Run "G:\AI-DASHENG\.venv\Scripts\pythonw.exe G:\AI-DASHENG\src\web_server.py"
 
 ' Gateway (9090)
 ws.Environment("Process").Item("GATEWAY_PORT") = "9090"
-ws.Environment("Process").Item("QQ_APP_ID") = "1904123291"
-ws.Environment("Process").Item("QQ_APP_SECRET") = "ASl4Oi3Ok6TqEd2SsJkCe7a4Z4a6dAiG"
+ws.Environment("Process").Item("QQ_APP_ID") = "1903881299"
+ws.Environment("Process").Item("QQ_APP_SECRET") = "VTSRRRSTVYbfjotz6DLTcmw7IUgt7Lap"
 ws.Run "G:\AI-DASHENG\.venv\Scripts\pythonw.exe G:\AI-DASHENG\src\gateway\server.py", 0, False
