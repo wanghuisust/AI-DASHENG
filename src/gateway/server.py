@@ -32,6 +32,8 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
+import urllib.error
 from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -316,9 +318,150 @@ def _cancel_active_request(chat_id: str, platform: str = "", is_group: bool = Fa
         return True
 
 
+def _handle_slash_command(message: PlatformMessage, text: str):
+    """处理斜杠命令：/new /reset /models /model /compact"""
+    target = _wechat if message.platform == "wechat" else (qq_adapter if message.platform == "qq" else None)
+    if not target:
+        return
+
+    cmd = text.lower().split()[0]
+    args = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+    chat_id = message.chat_id
+
+    def reply(text: str):
+        try:
+            r = PlatformReply(
+                platform=message.platform,
+                chat_id=chat_id,
+                text=text,
+                is_group=message.is_group,
+                at_user=message.user_id,
+            )
+            target.send_reply(r)
+        except Exception as e:
+            logger.warning(f"[slash-cmd] 回复失败: {e}")
+
+    try:
+        if cmd in ("/new", "/reset"):
+            # 删除 thread 历史，重新开始
+            url = f"{DASHENG_API}/v1/threads/{urllib.parse.quote(chat_id, safe='')}"
+            req = urllib.request.Request(url, method="DELETE")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            logger.info(f"[slash-cmd] /new thread={chat_id}: {result}")
+            # 同时清除 per-thread 模型覆盖
+            try:
+                set_url = f"{DASHENG_API}/v1/thread/model"
+                payload = json.dumps({"thread_id": chat_id, "model": ""}).encode("utf-8")
+                req2 = urllib.request.Request(set_url, data=payload,
+                                              headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req2, timeout=5)
+            except Exception:
+                pass
+            reply("🔄 已开启新会话")
+
+        elif cmd == "/models":
+            # 获取可用模型列表
+            url = f"{DASHENG_API}/v1/models"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            models = result.get("models", [])
+            default = result.get("default", "unknown")
+            if not models:
+                reply("📋 暂无可用模型")
+            else:
+                lines = ["📋 可用模型列表："]
+                for m in models:
+                    marker = " ← 当前" if m == default else ""
+                    lines.append(f"  • {m}{marker}")
+                reply("\n".join(lines))
+
+        elif cmd == "/model":
+            if not args:
+                # 显示当前模型
+                url = f"{DASHENG_API}/v1/status"
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    status = json.loads(resp.read().decode("utf-8"))
+                current = status.get("agent", {}).get("model", "unknown")
+                overrides = status.get("agent", {}).get("thread_model_overrides", {})
+                thread_model = overrides.get(chat_id)
+                if thread_model:
+                    reply(f"🤖 当前模型：{thread_model}（本会话覆盖）\n默认模型：{current}")
+                else:
+                    reply(f"🤖 当前模型：{current}\n用 /model 模型名 切换")
+            else:
+                # 切换模型
+                model_name = args
+                url = f"{DASHENG_API}/v1/thread/model"
+                payload = json.dumps({"thread_id": chat_id, "model": model_name}).encode("utf-8")
+                req = urllib.request.Request(url, data=payload,
+                                             headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                if result.get("status") == "ok":
+                    reply(f"✅ 已切换模型：{model_name}")
+                else:
+                    err = result.get("message", "未知错误")
+                    available = result.get("available", [])
+                    avail_text = "\n可用模型：" + ", ".join(available) if available else ""
+                    reply(f"❌ {err}{avail_text}")
+
+        elif cmd == "/compact":
+            # 手动压缩上下文
+            url = f"{DASHENG_API}/v1/thread/compact"
+            payload = json.dumps({"thread_id": chat_id}).encode("utf-8")
+            req = urllib.request.Request(url, data=payload,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            if result.get("status") == "ok":
+                before = result.get("before", "?")
+                after = result.get("after", "?")
+                msg_text = result.get("message", "")
+                if msg_text:
+                    reply(f"📦 {msg_text}")
+                else:
+                    reply(f"📦 上下文已压缩：{before} → {after} 条消息")
+            else:
+                reply(f"❌ 压缩失败：{result.get('message', '未知错误')}")
+
+        else:
+            # 未知命令，不拦截——当普通消息处理
+            # 取消同一 chat_id 的前一个请求
+            had_active = _cancel_active_request(
+                message.chat_id, message.platform, message.is_group, message.user_id
+            )
+            cancel_event = threading.Event()
+            t = threading.Thread(target=_process_and_reply, args=(message, cancel_event), daemon=True)
+            with _active_requests_lock:
+                _active_requests[message.chat_id] = {"thread": t, "cancel_event": cancel_event}
+            t.start()
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        try:
+            err_data = json.loads(body)
+            err_msg = err_data.get("message", body[:200])
+        except Exception:
+            err_msg = body[:200]
+        logger.warning(f"[slash-cmd] HTTP {e.code}: {err_msg}")
+        reply(f"❌ 命令执行失败：{err_msg}")
+    except Exception as e:
+        logger.warning(f"[slash-cmd] 异常: {e}")
+        reply(f"❌ 命令执行出错：{e}")
+
+
 def handle_message(message: PlatformMessage):
-    """统一消息处理入口 — 异步处理，不阻塞 WebSocket 事件循环"""
+    """统一消息处理入口 — 斜杠命令在此拦截，普通消息异步处理"""
     logger.info(f"[{message.platform}] {message.user_id}@{message.chat_id}: {message.text[:80]}")
+
+    # ── 斜杠命令拦截 ──
+    text = message.text.strip()
+    if text.startswith("/"):
+        _handle_slash_command(message, text)
+        return
 
     # 取消同一 chat_id 的前一个请求
     had_active = _cancel_active_request(

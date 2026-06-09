@@ -56,6 +56,39 @@ thread_locks: dict[str, threading.Lock] = {}
 _lock_acquire_time: dict[str, float] = {}  # 记录锁获取时间，防死锁
 _global_lock = threading.Lock()
 
+# Per-thread 模型配置（thread_id → model_name）
+_thread_models: dict[str, str] = {}
+
+# 可用模型列表（从 API 动态获取，启动时初始化）
+_AVAILABLE_MODELS: list[str] = []
+
+
+def _fetch_available_models():
+    """启动时从 API 获取可用模型列表"""
+    global _AVAILABLE_MODELS
+    try:
+        _env_path = Path(__file__).resolve().parent.parent / ".env"
+        load_dotenv(_env_path, override=True)
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not base_url or not api_key:
+            return
+        import urllib.request
+        req = urllib.request.Request(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [m["id"] for m in data.get("data", []) if "id" in m]
+            _AVAILABLE_MODELS = sorted(models)
+            print(f"[MODELS] 可用模型: {_AVAILABLE_MODELS}", flush=True)
+    except Exception as e:
+        print(f"[MODELS] 获取模型列表失败: {e}", flush=True)
+
+
+_fetch_available_models()
+
 # 启动时间
 _start_time = time.time()
 
@@ -360,6 +393,15 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         # POST /v1/chat/cancel — 取消正在处理的请求
         elif parsed.path == "/v1/chat/cancel":
             self._handle_cancel()
+        # GET /v1/models — 可用模型列表
+        elif parsed.path == "/v1/models":
+            self._handle_list_models()
+        # POST /v1/thread/model — 设置 thread 模型
+        elif parsed.path == "/v1/thread/model":
+            self._handle_set_thread_model()
+        # POST /v1/thread/compact — 手动压缩 thread 上下文
+        elif parsed.path == "/v1/thread/compact":
+            self._handle_compact_thread()
         # POST /v1/threads — 创建会话
         elif parsed.path == "/v1/threads":
             self._handle_create_thread()
@@ -407,6 +449,72 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"status": "error", "message": str(e)}, 500)
 
+    # ── 模型管理 ─────────────────────────────────────────────
+
+    def _handle_list_models(self):
+        """GET /v1/models — 返回可用模型列表"""
+        # 刷新模型列表（API 可能新增模型）
+        _fetch_available_models()
+        default_model = os.getenv("MODEL_NAME", "unknown")
+        self.send_json({
+            "models": _AVAILABLE_MODELS,
+            "default": default_model,
+        })
+
+    def _handle_set_thread_model(self):
+        """POST /v1/thread/model — 设置指定 thread 的模型
+        Body: {"thread_id": "...", "model": "agnes-2.0-flash"}
+        """
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            data = json.loads(body) if body else {}
+            thread_id = data.get("thread_id", "")
+            model = data.get("model", "")
+            if not thread_id:
+                self.send_json({"status": "error", "message": "thread_id required"}, 400)
+                return
+            if not model:
+                # 不指定 model 则恢复默认
+                _thread_models.pop(thread_id, None)
+                self.send_json({"status": "ok", "thread_id": thread_id, "model": "default"})
+                return
+            # 验证模型是否在可用列表中
+            if _AVAILABLE_MODELS and model not in _AVAILABLE_MODELS:
+                self.send_json({"status": "error", "message": f"模型 '{model}' 不在可用列表中", "available": _AVAILABLE_MODELS}, 400)
+                return
+            _thread_models[thread_id] = model
+            print(f"[MODEL] thread={thread_id} 切换为 {model}", flush=True)
+            self.send_json({"status": "ok", "thread_id": thread_id, "model": model})
+        except Exception as e:
+            self.send_json({"status": "error", "message": str(e)}, 500)
+
+    def _handle_compact_thread(self):
+        """POST /v1/thread/compact — 手动压缩指定 thread 的上下文
+        Body: {"thread_id": "..."}
+        """
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            data = json.loads(body) if body else {}
+            thread_id = data.get("thread_id", "")
+            if not thread_id:
+                self.send_json({"status": "error", "message": "thread_id required"}, 400)
+                return
+            messages = get_messages(thread_id)
+            before = len(messages)
+            if before <= 6:
+                self.send_json({"status": "ok", "message": "消息太少，无需压缩", "before": before, "after": before})
+                return
+            from context_compress import compress_messages
+            compressed = compress_messages(messages, llm=None)
+            thread_messages[thread_id] = compressed
+            after = len(compressed)
+            # 同步到持久化
+            save_ai_messages(thread_id, [])
+            print(f"[COMPACT] thread={thread_id} 压缩: {before} → {after} 条消息", flush=True)
+            self.send_json({"status": "ok", "before": before, "after": after})
+        except Exception as e:
+            self.send_json({"status": "error", "message": str(e)}, 500)
+
     # ── 状态 ─────────────────────────────────────────────
 
     def _handle_status(self):
@@ -417,6 +525,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
         gateway_status = check_gateway_status()
 
+        # per-thread 模型覆盖
+        thread_model_overrides = {tid: m for tid, m in _thread_models.items()}
+
         self.send_json({
             "agent": {
                 "status": "running",
@@ -426,6 +537,8 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 "context_length": context_length,
                 "enable_tools": enable_tools,
                 "active_threads": len(thread_messages),
+                "available_models": _AVAILABLE_MODELS,
+                "thread_model_overrides": thread_model_overrides,
             },
             "gateway": gateway_status,
         })
@@ -468,9 +581,16 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 invoke_result = [None]
                 invoke_error = [None]
 
+                # 读取 per-thread 模型配置
+                _thread_model = _thread_models.get(thread_id)
+                _sync_graph = graph  # 默认用全局 graph
+                if _thread_model:
+                    from graph import create_llm as _cl
+                    _sync_graph = build_graph(llm=_cl(model=_thread_model))
+
                 def _run_graph():
                     try:
-                        invoke_result[0] = graph.invoke(
+                        invoke_result[0] = _sync_graph.invoke(
                             {"messages": messages},
                             config={"recursion_limit": 40},
                         )
@@ -602,7 +722,13 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 print(f"[{_ts}] [STREAM] thread={thread_id} history={prev_count} msgs, new msg={user_msg[:80]}", flush=True)
 
                 # ── 构建带 cancel_event 的 graph 实例 ──
-                _cancelable_graph = build_graph(cancel_event=_local_cancel)
+                # 读取 per-thread 模型配置
+                _thread_model = _thread_models.get(thread_id)
+                _llm_for_graph = None
+                if _thread_model:
+                    from graph import create_llm
+                    _llm_for_graph = create_llm(model=_thread_model)
+                _cancelable_graph = build_graph(llm=_llm_for_graph, cancel_event=_local_cancel)
 
                 # ── 用队列桥接 async astream_events → 同步 SSE 发送 ──
                 import queue as _queue_mod
