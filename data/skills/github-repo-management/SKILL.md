@@ -56,48 +56,25 @@ REPO=$(echo "$OWNER_REPO" | cut -d/ -f2)
 
 ## 1. Cloning Repositories
 
-Cloning is pure `git` — works identically either way:
+⚠️ **中国网络环境：默认走国内镜像**。不要直连 GitHub，直接用镜像：
 
 ```bash
-# Clone via HTTPS (works with credential helper or token-embedded URL)
-git clone https://github.com/owner/repo-name.git
+# 默认方式：通过 ghproxy.net 镜像（最稳定）
+git clone --depth 1 https://ghproxy.net/https://github.com/owner/repo-name.git
 
-# Clone into a specific directory
-git clone https://github.com/owner/repo-name.git ./my-local-dir
+# 备用镜像（ghproxy.net 不可用时）
+git clone --depth 1 https://gh.llkk.cc/https://github.com/owner/repo-name.git
+git clone --depth 1 https://ghfast.top/https://github.com/owner/repo-name.git
 
-# Shallow clone (faster for large repos)
+# 如果镜像都不可用，再试直连
 git clone --depth 1 https://github.com/owner/repo-name.git
-
-# Clone a specific branch
-git clone --branch develop https://github.com/owner/repo-name.git
-
-# Clone via SSH (if SSH is configured)
-git clone git@github.com:owner/repo-name.git
 ```
 
-**With gh (shorthand):**
-
-```bash
-gh repo clone owner/repo-name
-gh repo clone owner/repo-name -- --depth 1
-```
-
-### ⚠️ 中国网络环境：直连失败走国内镜像
-
-如果直连 GitHub 被墙（超时/连接失败），**自动重试国内镜像**。按顺序尝试，第一个成功的就停下：
-
-```bash
-# ghproxy.net（最稳定）
-git clone https://ghproxy.net/https://github.com/owner/repo-name.git
-
-# gh.llkk.cc（备用）
-git clone https://gh.llkk.cc/https://github.com/owner/repo-name.git
-
-# ghfast.top（备用）
-git clone https://ghfast.top/https://github.com/owner/repo-name.git
-```
-
-**重要**：不要裸调 `git clone` 或 `git fetch` 直连 GitHub。**先试直连，失败后走国内镜像**。如果旧目录有残留（如不完整的 .git），先删除再重新 clone。
+**重要**：
+- **不要**裸调 `git clone` 或 `git fetch` 直连 GitHub
+- **不要**用 `rmdir` 或 `Remove-Item` 删目录——用 `rmdir /s /q` (cmd.exe)
+- 如果旧目录有残留（不完整的 .git），先 `rmdir /s /q 目录名` 再重新 clone
+- 如果旧 git 进程锁住了文件，先 `taskkill /F /IM git.exe` 再删目录
 
 ## 2. Creating Repositories
 
