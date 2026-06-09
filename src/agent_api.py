@@ -598,8 +598,18 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 store.create_thread(thread_id)
                 messages.append(HumanMessage(content=user_msg))
 
-                invoke_result = [None]
-                invoke_error = [None]
+                # ── 预压缩：在 graph.invoke 之前压缩历史消息 ──
+                # 原因：graph 的 recursion_limit 是 80，如果历史消息里有大量工具调用对，
+                # LLM 看到旧意图会继续重复执行，80次迭代全用在重复操作上。
+                # 在 API 层先压缩，确保传入 graph 的消息是精简的。
+                if len(messages) >= 20:
+                    from context_compress import compress_messages
+                    from graph import _get_compress_llm, create_llm
+                    _pre_llm = _get_compress_llm(create_llm())
+                    compressed = compress_messages(messages, llm=_pre_llm)
+                    if len(compressed) < len(messages):
+                        print(f"[PRE-COMPRESS] thread={thread_id} {len(messages)}→{len(compressed)} msgs", flush=True)
+                        messages = compressed
 
                 # 读取 per-thread 模型配置
                 _thread_model = _thread_models.get(thread_id)
@@ -737,6 +747,18 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 prev_count = len(messages)
                 store.create_thread(thread_id)
                 messages.append(HumanMessage(content=user_msg))
+
+                # ── 预压缩：在 graph.astream 之前压缩历史消息 ──
+                # 同步接口一样的问题：历史消息太多让 LLM 沿旧意图重复执行
+                if len(messages) >= 20:
+                    from context_compress import compress_messages
+                    from graph import _get_compress_llm, create_llm
+                    _pre_llm = _get_compress_llm(create_llm())
+                    compressed = compress_messages(messages, llm=_pre_llm)
+                    if len(compressed) < len(messages):
+                        print(f"[STREAM-PRE-COMPRESS] thread={thread_id} {len(messages)}→{len(compressed)} msgs", flush=True)
+                        messages = compressed
+
                 import datetime as _dt
                 _ts = _dt.datetime.now().strftime("%H:%M:%S")
                 print(f"[{_ts}] [STREAM] thread={thread_id} history={prev_count} msgs, new msg={user_msg[:80]}", flush=True)
