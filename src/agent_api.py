@@ -618,6 +618,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     from graph import create_llm as _cl
                     _sync_graph = build_graph(llm=_cl(model=_thread_model))
 
+                invoke_result = [None]
+                invoke_error = [None]
+
                 def _run_graph():
                     try:
                         invoke_result[0] = _sync_graph.invoke(
