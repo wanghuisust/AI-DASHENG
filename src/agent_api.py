@@ -271,8 +271,12 @@ def _summarize_without_tools(messages: list) -> str:
         # 只保留 system + 最后几条 + 总结请求
         summary_messages = [summary_messages[0]] + summary_messages[-5:]
     
-    response = llm_no_tools.invoke(summary_messages)
-    return response.content if response.content else "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
+    try:
+        response = llm_no_tools.invoke(summary_messages, config={"timeout": 30})
+        return response.content if response.content else "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
+    except Exception as e:
+        print(f"[RECURSION-LIMIT] 无工具总结超时或失败: {e}", flush=True)
+        return "抱歉，处理步骤过多已自动停止。请尝试更简单的提问方式。"
 
 
 # ── Gateway 状态检查 ────────────────────────────────────────
