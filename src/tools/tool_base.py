@@ -66,18 +66,26 @@ def _persist_result(content: str, tool_use_id: str) -> str:
     filepath = os.path.join(session_dir, f"{safe_id}.txt")
 
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(filepath, "x", encoding="utf-8") as f:
             f.write(content)
+    except FileExistsError:
+        pass  # 已存在，跳过（幂等）
     except OSError as e:
         return content[:DEFAULT_MAX_RESULT_SIZE_CHARS] + \
             f"\n\n... (持久化失败: {e}，已截断至 {DEFAULT_MAX_RESULT_SIZE_CHARS} 字符)"
 
     size_kb = len(content) / 1024
-    preview = content[:PREVIEW_SIZE]
+    # 在换行处截断预览，避免代码/日志截断到一半（迁移自 Claude Code generatePreview）
+    raw_preview = content[:PREVIEW_SIZE * 2]  # 多取一些找换行
+    last_nl = raw_preview.rfind('\n', PREVIEW_SIZE // 2)
+    if last_nl > 0:
+        preview = content[:last_nl]
+    else:
+        preview = content[:PREVIEW_SIZE]
     return (
         f"<persisted-output>\n"
         f"输出过大 ({size_kb:.1f} KB)，完整内容已保存到: {filepath}\n\n"
-        f"预览（前 {PREVIEW_SIZE} 字符）:\n{preview}\n...\n"
+        f"预览（前 {len(preview)} 字符）:\n{preview}\n...\n"
         f"</persisted-output>"
     )
 
@@ -100,6 +108,77 @@ def process_tool_result(content: str, tool_name: str, tool_use_id: str,
     print(f"[TOOL-RESULT] {tool_name} 输出 {len(content)} 字符超过上限 "
           f"{max_result_size}，持久化到磁盘", flush=True)
     return _persist_result(content, tool_use_id)
+
+
+def truncate_error(error_str: str, head_size: int = 2000, tail_size: int = 2000) -> str:
+    """错误信息头尾保留截断（迁移自 Claude Code formatError）
+
+    替代简单 [:500] 截断，保留头尾关键信息：
+    - ≤ head+tail → 原样返回
+    - > head+tail → 头 head_size + 省略提示 + 尾 tail_size
+    """
+    if len(error_str) <= head_size + tail_size:
+        return error_str
+    head = error_str[:head_size]
+    tail = error_str[-tail_size:]
+    omitted = len(error_str) - head_size - tail_size
+    return f"{head}\n\n... (省略 {omitted} 字符) ...\n\n{tail}"
+
+
+def enforce_tool_result_budget(results: list, max_total_chars: int = MAX_PER_MESSAGE_CHARS) -> list:
+    """聚合工具结果预算（迁移自 Claude Code enforceToolResultBudget）
+
+    同一轮所有并行工具结果的总大小限制。超过预算时：
+    1. 计算所有结果的 content 总长度
+    2. 按长度从大到小排序
+    3. 选最长的几个持久化，直到总大小 ≤ 预算
+    4. 替换对应的 ToolMessage content 为预览
+
+    Args:
+        results: ToolMessage 列表
+        max_total_chars: 总大小上限，默认 200K
+
+    Returns:
+        处理后的 ToolMessage 列表
+    """
+    from langchain_core.messages import ToolMessage as TM
+
+    total = sum(len(r.content) for r in results if isinstance(r, TM))
+    if total <= max_total_chars:
+        return results
+
+    print(f"[TOOL-BUDGET] 工具结果总大小 {total} 字符超过预算 {max_total_chars}，"
+          f"开始持久化最长的结果", flush=True)
+
+    # 按内容长度从大到小排序，持久化最长的几个
+    indexed = [(i, len(r.content)) for i, r in enumerate(results) if isinstance(r, TM)]
+    indexed.sort(key=lambda x: x[1], reverse=True)
+
+    # 逐个持久化最长的，直到总大小 ≤ 预算
+    current_total = total
+    persisted_indices = set()
+    for idx, size in indexed:
+        if current_total <= max_total_chars:
+            break
+        result = results[idx]
+        if size <= PREVIEW_SIZE * 2:
+            continue  # 太小不值得持久化
+        # 持久化
+        preview = _persist_result(result.content, result.tool_call_id or f"budget_{idx}")
+        saved = size - len(preview)
+        current_total -= saved
+        persisted_indices.add(idx)
+        # 创建新的 ToolMessage（保留 name/tool_call_id/status）
+        results[idx] = TM(
+            content=preview,
+            name=result.name,
+            tool_call_id=result.tool_call_id,
+            status=result.status if hasattr(result, 'status') else None,
+        )
+
+    print(f"[TOOL-BUDGET] 持久化 {len(persisted_indices)} 个结果，"
+          f"总大小 {total} → {current_total} 字符", flush=True)
+    return results
 
 
 # ── DashengTool 基类 ──

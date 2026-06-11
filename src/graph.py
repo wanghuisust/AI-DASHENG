@@ -759,16 +759,18 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
             ),
             name=tool_name,
             tool_call_id=tool_call_id,
+            status="error",
         )
 
     # ── 线程已结束，处理结果 ──
     if error_container[0] is not None:
-        # 工具报错：返回错误信息，提示换方式
-        err = error_container[0][:500]
-        print(f"[{_ts}] [TOOL-ERROR] {tool_name} 执行报错: {err[:200]}", flush=True)
+        # 工具报错：返回错误信息，提示换方式（使用头尾保留截断）
+        from tools.tool_base import truncate_error
+        err = truncate_error(error_container[0], head_size=2000, tail_size=2000)
+        print(f"[{_ts}] [TOOL-ERROR] {tool_name} 执行报错: {error_container[0][:200]}", flush=True)
         if progress_callback:
             try:
-                progress_callback("tool_error", {"tool": tool_name, "error": err[:200]})
+                progress_callback("tool_error", {"tool": tool_name, "error": error_container[0][:200]})
             except Exception:
                 pass
         return ToolMessage(
@@ -778,15 +780,17 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
             ),
             name=tool_name,
             tool_call_id=tool_call_id,
+            status="error",
         )
 
-    # 正常返回
+    # 正常返回（包括验证错误等通过 _run() 返回的结果）
     result = result_container[0]
     if result is None:
         result = "(无输出)"
     _result_str = str(result)
     _result_preview = _result_str[:80].replace('\n', '\\n')
-    print(f"[{_ts}] [TOOL-OK] {tool_name}: {_result_preview}", flush=True)
+    _is_failed = _is_tool_failed(_result_str)
+    print(f"[{_ts}] [TOOL-{'ERROR' if _is_failed else 'OK'}] {tool_name}: {_result_preview}", flush=True)
     if progress_callback:
         try:
             progress_callback("tool_done", {"tool": tool_name, "content": _result_str[:200]})
@@ -796,6 +800,7 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
         content=_result_str,
         name=tool_name,
         tool_call_id=tool_call_id,
+        status="error" if _is_failed else None,
     )
 
 def _set_tool_progress_callback(callback):
@@ -866,7 +871,16 @@ def _execute_single_tool(tc: dict, tool_map: dict, guardrail: ToolCallGuardrail,
         import datetime as _dt
         _ts = _dt.datetime.now().strftime("%H:%M:%S")
         print(f"[{_ts}] [GUARDRAIL-BLOCK] {tool_name}: {pre_decision.code} (count={pre_decision.count})", flush=True)
-        return guardrail.synthetic_result(pre_decision, tool_call_id)
+        result = guardrail.synthetic_result(pre_decision, tool_call_id)
+        # guardrail block 也是错误
+        if isinstance(result, ToolMessage) and result.status != "error":
+            result = ToolMessage(
+                content=result.content,
+                name=result.name,
+                tool_call_id=result.tool_call_id,
+                status="error",
+            )
+        return result
 
     # ── 工具未找到 ──
     tool_func = tool_map.get(tool_name)
@@ -875,6 +889,7 @@ def _execute_single_tool(tc: dict, tool_map: dict, guardrail: ToolCallGuardrail,
             content="[工具未找到] {tool_name} 不存在。请换用其他工具。",
             name=tool_name,
             tool_call_id=tool_call_id,
+            status="error",
         )
         # 记录为失败
         guardrail.after_call(tool_name, tool_args, result_msg.content, failed=True)
@@ -927,62 +942,90 @@ def tool_node_with_timeout(state: AgentState) -> dict:
         tc = last_message.tool_calls[0]
         results.append(_execute_single_tool(tc, tool_map, _gr, _pcb))
     else:
-        # 多个工具调用并行执行（注意：guardrail 不是线程安全的，串行化 before_call）
-        # 先对所有调用做 before_call 检查，分离 block 和 allow
-        allowed_tcs = []
-        for tc in last_message.tool_calls:
+        # 多个工具调用并行执行
+        # 1. 先串行化 before_call（guardrail 非线程安全）
+        blocked_results = {}   # tc_index -> ToolMessage
+        allowed_tcs = []      # [(tc, original_index), ...]
+        for i, tc in enumerate(last_message.tool_calls):
             pre_decision = _gr.before_call(tc["name"], tc.get("args", {}))
             if not pre_decision.allows_execution:
                 import datetime as _dt
                 _ts = _dt.datetime.now().strftime("%H:%M:%S")
                 print(f"[{_ts}] [GUARDRAIL-BLOCK] {tc['name']}: {pre_decision.code}", flush=True)
-                results.append(_gr.synthetic_result(pre_decision, tc.get("id", "")))
+                block_msg = _gr.synthetic_result(pre_decision, tc.get("id", ""))
+                # 标记 status=error
+                if isinstance(block_msg, ToolMessage) and block_msg.status != "error":
+                    block_msg = ToolMessage(
+                        content=block_msg.content,
+                        name=block_msg.name,
+                        tool_call_id=block_msg.tool_call_id,
+                        status="error",
+                    )
+                blocked_results[i] = block_msg
             else:
-                allowed_tcs.append(tc)
+                allowed_tcs.append((tc, i))
 
-        # 并行执行 allow 的调用
+        # 2. 并行执行允许的调用（工具执行本身是线程安全的）
+        parallel_results = {}  # original_index -> ToolMessage
         if allowed_tcs:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(allowed_tcs), 4)) as executor:
                 futures = {}
-                for tc in allowed_tcs:
+                for tc, orig_idx in allowed_tcs:
                     tool_func = tool_map.get(tc["name"])
                     if tool_func is None:
                         result_msg = ToolMessage(
                             content=f"[工具未找到] {tc['name']} 不存在。请换用其他工具。",
                             name=tc["name"],
                             tool_call_id=tc.get("id", ""),
+                            status="error",
                         )
-                        _gr.after_call(tc["name"], tc.get("args", {}), result_msg.content, failed=True)
-                        results.append(result_msg)
+                        parallel_results[orig_idx] = result_msg
                     else:
                         future = executor.submit(
                             _execute_tool_with_timeout, tool_func, tc["name"],
                             tc.get("args", {}), tc.get("id", ""),
                             progress_callback=_pcb
                         )
-                        futures[future] = tc
+                        futures[future] = (tc, orig_idx)
 
+                # 收集并行结果
                 for future in concurrent.futures.as_completed(futures, timeout=120):
+                    tc, orig_idx = futures[future]
                     try:
                         result_msg = future.result(timeout=5)
-                        tc = futures[future]
-                        # after_call 分类
-                        failed = _is_tool_failed(result_msg.content)
-                        decision = _gr.after_call(tc["name"], tc.get("args", {}), result_msg.content, failed=failed)
-                        if decision.action in {"warn", "halt"} and decision.message:
-                            result_msg = ToolMessage(
-                                content=_gr.append_guidance(result_msg.content, decision),
-                                name=result_msg.name,
-                                tool_call_id=result_msg.tool_call_id,
-                            )
-                        results.append(result_msg)
+                        parallel_results[orig_idx] = result_msg
                     except Exception as e:
-                        _tcid = futures[future].get("id", "")
-                        results.append(ToolMessage(
+                        _tcid = tc.get("id", "")
+                        parallel_results[orig_idx] = ToolMessage(
                             content=f"[工具执行异常] {e}。请换用其他方式完成此操作。",
                             name="unknown",
                             tool_call_id=_tcid,
-                        ))
+                            status="error",
+                        )
+
+        # 3. 串行化 after_call（guardrail 非线程安全）+ 按 tool_call 顺序排列
+        for i, tc in enumerate(last_message.tool_calls):
+            if i in blocked_results:
+                results.append(blocked_results[i])
+                _gr.after_call(tc["name"], tc.get("args", {}),
+                               blocked_results[i].content, failed=True)
+            elif i in parallel_results:
+                result_msg = parallel_results[i]
+                failed = _is_tool_failed(result_msg.content)
+                decision = _gr.after_call(tc["name"], tc.get("args", {}),
+                                          result_msg.content, failed=failed)
+                if decision.action in {"warn", "halt"} and decision.message:
+                    result_msg = ToolMessage(
+                        content=_gr.append_guidance(result_msg.content, decision),
+                        name=result_msg.name,
+                        tool_call_id=result_msg.tool_call_id,
+                        status=result_msg.status if hasattr(result_msg, 'status') else None,
+                    )
+                results.append(result_msg)
+
+    # P0-1: 聚合工具结果预算（迁移自 Claude Code enforceToolResultBudget）
+    from tools.tool_base import enforce_tool_result_budget
+    results = enforce_tool_result_budget(results)
 
     return {"messages": results}
 
