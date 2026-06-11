@@ -412,6 +412,9 @@ class ToolCallGuardrail:
     NO_PROGRESS_WARN_AFTER = 2      # 幂等工具同结果2次 → 警告
     NO_PROGRESS_BLOCK_AFTER = 4     # 幂等工具同结果4次 → 阻止（原5→4）
 
+    # 通用高频工具允许更多调用次数（terminal_execute/read_file 是主要探索工具）
+    _HIGH_FREQ_TOOL_HALT_AFTER = 50
+
     def __init__(self):
         self.reset()
 
@@ -478,7 +481,9 @@ class ToolCallGuardrail:
         self._tool_call_counts[tool_name] = call_count
 
         # 同工具名总调用超过硬上限 → halt（不管成败，防止LLM反复用同一工具探索）
-        if call_count >= self.SAME_TOOL_CALL_HALT_AFTER:
+        # 通用高频工具（terminal_execute, read_file）允许更多调用
+        halt_after = self._HIGH_FREQ_TOOL_HALT_AFTER if tool_name in ("terminal_execute", "read_file") else self.SAME_TOOL_CALL_HALT_AFTER
+        if call_count >= halt_after:
             decision = _GuardrailDecision(
                 action="halt",
                 code="same_tool_call_overuse_halt",
