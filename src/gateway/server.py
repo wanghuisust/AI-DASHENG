@@ -1004,13 +1004,9 @@ def _process_and_reply(message: PlatformMessage):
                 else:
                     logger.info(f"[{message.platform}-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
             elif streaming_sent > 0 and streaming_sent >= len(reply_text):
-                # streaming 已推送超过 reply_text 长度（多轮累积），说明 reply_text 只是最后一轮
-                # 直接发完整 reply_text（避免 reply_text[streaming_sent:] 越界变成空字符串）
-                try:
-                    _target.send_reply(reply)
-                    logger.info(f"[{message.platform}-streaming] streaming_sent={streaming_sent} >= reply_text_len={len(reply_text)}，发完整回复")
-                except Exception as e:
-                    logger.error(f"{message.platform}发送回复异常: {e}")
+                # streaming 已推送超过 reply_text 长度（多轮累积）
+                # 中间文本已经包含最终结果的内容，不再重复发送完整回复
+                logger.info(f"[{message.platform}-streaming] streaming_sent={streaming_sent} >= reply_text_len={len(reply_text)}，跳过最终消息（已推送）")
             else:
                 # 无 streaming 推送，发完整消息
                 try:
