@@ -650,8 +650,9 @@ def _process_and_reply(message: PlatformMessage):
         _last_flush_time = [0.0]         # 上次发送时间
         _flush_timer = [None]            # 定时器
 
-        # ── 微信增量推送状态 ──
-        _streaming_text_sent = [0]       # 已推送的文本字符数
+# ── 微信增量推送状态 ──
+        _streaming_text_sent = [0]       # 当前轮已推送的文本字符数
+        _streaming_total_sent = [0]      # 整个请求期间累计推送的总字符数（text_reset不重置）
 
         # ── QQ 平台：任务开始后发送"正在处理"指示 ──
         _qq_working_sent = [False]  # 追踪是否已发送过 QQ 的"正在处理"消息
@@ -871,6 +872,7 @@ def _process_and_reply(message: PlatformMessage):
                             )
                             _target.send_reply(reply)
                             _streaming_text_sent[0] = cut_pos
+                            _streaming_total_sent[0] += len(chunk_text)  # 累计总推送量
                             _streaming_last_push[0] = now
                             logger.debug(f"[{message.platform}-streaming] 推送 {len(chunk_text)} 字, 累计 {cut_pos}/{len(full_text)}")
                         except Exception as e:
@@ -982,14 +984,15 @@ def _process_and_reply(message: PlatformMessage):
 
         if _target:
             # ── 发送最终回复 ──
-            # streaming 已推送部分文本，检测最终回复是否与已推送内容重复
-            streaming_sent = _streaming_text_sent[0]
-            if streaming_sent > 0 and streaming_sent >= len(reply_text):
-                # 已推送内容覆盖了最终回复，不再重复发
-                logger.info(f"[{message.platform}-streaming] streaming_sent={streaming_sent} >= reply_text_len={len(reply_text)}，跳过最终消息（已推送）")
-            elif streaming_sent > 0 and streaming_sent < len(reply_text):
+            # 用 _streaming_total_sent（整个请求累计推送量）判断是否重复
+            # _streaming_text_sent 在 text_reset 时会清零，不能用它判断
+            total_sent = _streaming_total_sent[0]
+            if total_sent > 0 and total_sent >= len(reply_text):
+                # 已推送总量覆盖了最终回复长度，不再重复发
+                logger.info(f"[{message.platform}-streaming] total_sent={total_sent} >= reply_text_len={len(reply_text)}，跳过最终消息（已推送）")
+            elif total_sent > 0 and total_sent < len(reply_text):
                 # 已推送部分，只发剩余部分
-                remaining = reply_text[streaming_sent:].strip()
+                remaining = reply_text[total_sent:].strip()
                 if remaining:
                     try:
                         tail_reply = PlatformReply(
@@ -1000,11 +1003,11 @@ def _process_and_reply(message: PlatformMessage):
                             at_user=message.user_id,
                         )
                         _target.send_reply(tail_reply)
-                        logger.info(f"[{message.platform}-streaming] 推送剩余 {len(remaining)} 字（streaming 已推送 {streaming_sent}/{len(reply_text)}）")
+                        logger.info(f"[{message.platform}-streaming] 推送剩余 {len(remaining)} 字（total_sent {total_sent}/{len(reply_text)}）")
                     except Exception as e:
                         logger.warning(f"[{message.platform}-streaming] 剩余推送失败: {e}")
                 else:
-                    logger.info(f"[{message.platform}-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
+                    logger.info(f"[{message.platform}-streaming] 完整已推送 {total_sent}/{len(reply_text)}，跳过最终消息")
             else:
                 # 无 streaming 推送，发完整回复
                 try:
