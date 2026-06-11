@@ -741,6 +741,17 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
     result_container = [None]   # [result_str]
     error_container = [None]    # [error_str]
     progress_container = [0]    # [已等待轮数]
+    last_progress_val = [0]     # [上次检查时工具的进展值]
+
+    # 获取工具级进度计数器（如 disk_analyze 的 os.walk 计数）
+    _tool_progress_fn = None
+    if tool_name == "disk_analyze":
+        try:
+            from tools.disk_tool import get_progress_value
+            _tool_progress_fn = get_progress_value
+            last_progress_val[0] = _tool_progress_fn()
+        except Exception:
+            pass
 
     def _run_tool():
         try:
@@ -760,13 +771,46 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
             # 线程已结束
             break
 
-        # 线程还活着 → 检查是否有部分结果
+        # 线程还活着 → 检查是否有进展
         progress_container[0] += 1
         round_num = progress_container[0]
 
         if result_container[0] is not None or error_container[0] is not None:
             # 有输出了但线程还活着（理论上不太可能，但防万一）
             break
+
+        # ── 检查工具级进度计数器 ──
+        has_progress = False
+        if _tool_progress_fn is not None:
+            try:
+                current_val = _tool_progress_fn()
+                if current_val > last_progress_val[0]:
+                    has_progress = True
+                    last_progress_val[0] = current_val
+                    print(f"[{_ts}] [TOOL-PROGRESS] {tool_name} 进展: {current_val} (轮{round_num})", flush=True)
+            except Exception:
+                pass
+
+        if has_progress:
+            # 有进展 → 继续等待，重置超时计数（但总轮数上限仍然保护）
+            if round_num >= _MAX_TIMEOUT_ROUNDS:
+                # 即使有进展，也不能永远等
+                print(f"[{_ts}] [TOOL-TIMEOUT] {tool_name} 等待超过 {round_num}×{timeout}s，虽有进展但强制中断", flush=True)
+                if progress_callback:
+                    try:
+                        progress_callback("tool_timeout", {"tool": tool_name, "timeout": round_num * timeout})
+                    except Exception:
+                        pass
+                return ToolMessage(
+                    content=(
+                        f"[工具超时] {tool_name} 执行超过 {round_num * timeout} 秒（虽有进展但耗时过长）。"
+                        "请换用其他方式完成（例如扫描子目录而非整个盘符）。"
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                )
+            # 有进展且未达上限 → 继续等待下一轮
+            continue
 
         if round_num >= _MAX_TIMEOUT_ROUNDS:
             # 超过最大等待轮数，强制超时
