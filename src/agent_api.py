@@ -103,12 +103,15 @@ def get_messages(thread_id: str) -> list:
             valid_tool_ids = set()
             for m in db_msgs:
                 if m.get("role") == "ai":
-                    tc_str = m.get("tool_calls", "")
-                    if tc_str:
+                    tc_data = m.get("tool_calls", "")
+                    if tc_data:
                         try:
-                            tcs = json.loads(tc_str)
+                            # store.get_messages 返回的 tool_calls 可能是已解析的 list，也可能是 JSON 字符串
+                            if isinstance(tc_data, list):
+                                tcs = tc_data
+                            else:
+                                tcs = json.loads(tc_data)
                             for tc in tcs:
-                                # 从 tool_calls 中提取 id（如果有的话）
                                 tc_id = tc.get("id", "")
                                 if tc_id:
                                     valid_tool_ids.add(tc_id)
@@ -123,10 +126,14 @@ def get_messages(thread_id: str) -> list:
                 elif role == "ai":
                     # 恢复 AIMessage 时带上 tool_calls，否则后续 ToolMessage 会变成孤立消息
                     ai_kwargs = {"content": content}
-                    tc_str = m.get("tool_calls", "")
-                    if tc_str:
+                    tc_data = m.get("tool_calls", "")
+                    if tc_data:
                         try:
-                            tcs = json.loads(tc_str)
+                            # store.get_messages 返回的 tool_calls 可能是已解析的 list，也可能是 JSON 字符串
+                            if isinstance(tc_data, list):
+                                tcs = tc_data
+                            else:
+                                tcs = json.loads(tc_data)
                             if tcs:
                                 ai_kwargs["tool_calls"] = tcs
                         except (json.JSONDecodeError, TypeError):
