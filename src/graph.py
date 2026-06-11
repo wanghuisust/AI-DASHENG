@@ -902,6 +902,11 @@ def _execute_single_tool(tc: dict, tool_map: dict, guardrail: ToolCallGuardrail,
 
     # ── after_call 分类 ──
     failed = _is_tool_failed(result_msg.content)
+    # 压缩层去重标记：如果工具结果被标记为"(同第X条消息的...输出，已去重)"
+    # 说明这是重复结果，guardrail应视为无进展（等同失败）
+    result_text = result_msg.content if isinstance(result_msg.content, str) else str(result_msg.content or "")
+    if "(同第" in result_text and "条消息" in result_text and "已去重" in result_text:
+        failed = True
     decision = guardrail.after_call(tool_name, tool_args, result_msg.content, failed=failed)
 
     # 附加 guidance（warn/halt 时追加提示到结果）
@@ -1265,11 +1270,13 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
     # 防止 guardrail 阈值宽松时 LLM 一直在"进步"但永远不会停
     # 注意：恢复的历史消息中的工具调用不算本次，避免旧历史吃掉额度
     start_idx = state.get("session_start_index", 0)
+    total_msgs = len(state["messages"])
     session_tool_results = sum(
         1 for msg in state["messages"][start_idx:]
         if hasattr(msg, "type") and msg.type == "tool"
     )
     ABSOLUTE_TOOL_LIMIT = 100
+    print(f"[{_ts}] [LIMIT-CHECK] start_idx={start_idx} total_msgs={total_msgs} session_tools={session_tool_results}/{ABSOLUTE_TOOL_LIMIT}", flush=True)
     if session_tool_results >= ABSOLUTE_TOOL_LIMIT:
         print(f"[{_ts}] [ABSOLUTE-LIMIT] 本次工具调用次数 {session_tool_results} 达到上限 {ABSOLUTE_TOOL_LIMIT}", flush=True)
         last_message.tool_calls = []
