@@ -631,7 +631,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 def _run_graph():
                     try:
                         invoke_result[0] = _sync_graph.invoke(
-                            {"messages": messages},
+                            {"messages": messages, "session_start_index": prev_count},
                             config={"recursion_limit": 150},
                         )
                     except Exception as e:
@@ -832,7 +832,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     async def _astream():
                         try:
                             async for event in _cancelable_graph.astream_events(
-                                {"messages": messages},
+                                {"messages": messages, "session_start_index": prev_count},
                                 version="v2",
                                 config={"recursion_limit": 150},
                             ):

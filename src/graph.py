@@ -41,6 +41,7 @@ from constants import estimate_tokens, get_max_context_tokens, trim_messages_to_
 class AgentState(TypedDict):
     """Agent 状态，贯穿整个图执行"""
     messages: Annotated[list, add_messages]
+    session_start_index: int  # 本次请求开始时 messages 的长度（历史消息不算本次工具调用次数）
 
 
 # ── LLM 初始化 ─────────────────────────────────────────────
@@ -802,6 +803,8 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
         _msg_kwargs["status"] = "error"
     return ToolMessage(**_msg_kwargs)
 
+_tool_progress_callback = None  # 默认无回调（同步接口不设）
+
 def _set_tool_progress_callback(callback):
     """设置工具执行进度回调（线程安全）"""
     global _tool_progress_callback
@@ -1258,15 +1261,17 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
             )
         return "end"
 
-    # ── 兜底安全上限：消息总数超过 200 条（约 100 轮 LLM+工具交互）──
+    # ── 兜底安全上限：只计数本次请求新增的工具调用 ──
     # 防止 guardrail 阈值宽松时 LLM 一直在"进步"但永远不会停
-    total_tool_results = sum(
-        1 for msg in state["messages"]
+    # 注意：恢复的历史消息中的工具调用不算本次，避免旧历史吃掉额度
+    start_idx = state.get("session_start_index", 0)
+    session_tool_results = sum(
+        1 for msg in state["messages"][start_idx:]
         if hasattr(msg, "type") and msg.type == "tool"
     )
     ABSOLUTE_TOOL_LIMIT = 100
-    if total_tool_results >= ABSOLUTE_TOOL_LIMIT:
-        print(f"[{_ts}] [ABSOLUTE-LIMIT] 工具调用总次数 {total_tool_results} 达到上限 {ABSOLUTE_TOOL_LIMIT}", flush=True)
+    if session_tool_results >= ABSOLUTE_TOOL_LIMIT:
+        print(f"[{_ts}] [ABSOLUTE-LIMIT] 本次工具调用次数 {session_tool_results} 达到上限 {ABSOLUTE_TOOL_LIMIT}", flush=True)
         last_message.tool_calls = []
         limit_reason = "本次对话的工具调用次数已达上限，已自动停止"
         summary = _halt_summarize(state["messages"], limit_reason)
