@@ -796,12 +796,11 @@ def _execute_tool_with_timeout(tool_func, tool_name: str, tool_args: dict, tool_
             progress_callback("tool_done", {"tool": tool_name, "content": _result_str[:200]})
         except Exception:
             pass
-    return ToolMessage(
-        content=_result_str,
-        name=tool_name,
-        tool_call_id=tool_call_id,
-        status="error" if _is_failed else None,
-    )
+    # status: 只接受 "error" 或不传（不能传 None）
+    _msg_kwargs = dict(content=_result_str, name=tool_name, tool_call_id=tool_call_id)
+    if _is_failed:
+        _msg_kwargs["status"] = "error"
+    return ToolMessage(**_msg_kwargs)
 
 def _set_tool_progress_callback(callback):
     """设置工具执行进度回调（线程安全）"""

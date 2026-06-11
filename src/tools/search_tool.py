@@ -2,6 +2,11 @@
 
 优先使用 rg（ripgrep）搜索，回退到 grep，最终回退到纯 Python os.walk。
 支持分页（offset/limit）、多种输出模式、上下文行。
+
+v2 改进（借鉴 Hermes）：
+- 搜索结果返回绝对路径（避免 read_file 拼接错误）
+- 当默认目录无结果时，自动扫描多个候选工作目录（工作目录发现）
+- 搜索无结果时给出可用目录提示
 """
 
 import logging
@@ -15,6 +20,99 @@ from pydantic import BaseModel, Field
 from tools.tool_base import build_tool, ValidationResult, DEFAULT_MAX_RESULT_SIZE_CHARS
 
 logger = logging.getLogger(__name__)
+
+# ── 工作目录发现 ──────────────────────────────────────────
+# 当 directory="." 且搜不到结果时，自动扫描这些候选路径
+
+def _get_project_roots() -> list[str]:
+    """获取项目根目录列表（动态发现，不硬编码具体项目路径）
+
+    策略（只加入看起来像代码/AI项目的目录，避免扫描无关大目录）：
+    1. 当前进程 cwd
+    2. 盘符根目录下有 .git 或含代码指示的目录（AI-* / code / src / project 等）
+    3. 用户 HOME 下的项目目录
+    """
+    roots = []
+    seen = set()
+
+    def _add(path: str):
+        p = os.path.normpath(path)
+        if p not in seen and os.path.isdir(p):
+            seen.add(p)
+            roots.append(p)
+
+    # 项目目录名关键词（只扫描看起来像代码/AI项目的）
+    _PROJECT_KEYWORDS = {"ai", "code", "src", "project", "github", "git", "repo",
+                          "llm", "tts", "dasheng", "claude", "hermes", "comfyui",
+                          "llama", "vllm", "model", "dify", "openclaw", "torch",
+                          "hugging", "qwen"}
+    
+    def _looks_like_project(name: str) -> bool:
+        """目录名看起来像代码/AI项目"""
+        lower = name.lower()
+        # 含关键词
+        for kw in _PROJECT_KEYWORDS:
+            if kw in lower:
+                return True
+        # 以大写字母开头+横线（如 AI-DASHENG, AI-LLM）
+        if re.match(r'^[A-Z]-', name):
+            return True
+        # 含 .git（精确判定）
+        return False
+
+    # 1. 当前工作目录
+    _add(os.getcwd())
+    # 也加入 cwd 的父目录（如果是子目录）
+    parent = os.path.dirname(os.getcwd())
+    if parent and os.path.isdir(parent):
+        _add(parent)
+
+    # 2. 扫描盘符根目录 — 只加入看起来像项目的
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive):
+                try:
+                    for entry in os.scandir(drive):
+                        if not entry.is_dir():
+                            continue
+                        name = entry.name
+                        # 跳过系统和隐藏目录
+                        if name.startswith(".") or name.startswith("$") or name in {
+                            "Windows", "Program Files", "Program Files (x86)",
+                            "ProgramData", "Users", "Recovery", "Boot",
+                            "Documents and Settings", "System Volume Information",
+                            "msys64", "miniconda3", "conda",
+                        }:
+                            continue
+                        if _looks_like_project(name) or os.path.isdir(os.path.join(entry.path, ".git")):
+                            _add(entry.path)
+                except (PermissionError, OSError):
+                    pass
+    else:
+        home = os.path.expanduser("~")
+        _add(home)
+        for base in [home, "/opt", "/srv"]:
+            if os.path.isdir(base):
+                try:
+                    for entry in os.scandir(base):
+                        if not entry.is_dir() or entry.name.startswith("."):
+                            continue
+                        if _looks_like_project(entry.name) or os.path.isdir(os.path.join(entry.path, ".git")):
+                            _add(entry.path)
+                except (PermissionError, OSError):
+                    pass
+
+    # 3. 用户 HOME 下的常见项目目录
+    home = os.path.expanduser("~")
+    for subdir in ["projects", "code", "src", "workspace", "repos"]:
+        p = os.path.join(home, subdir)
+        if os.path.isdir(p):
+            _add(p)
+
+    return roots
+
 
 # ── 工具函数 ──────────────────────────────────────────────
 
@@ -64,6 +162,13 @@ def _parse_match_line(line: str) -> Optional[tuple[str, int, str]]:
     return None
 
 
+def _to_absolute(path: str, base: str) -> str:
+    """将路径转为绝对路径（如果还不是的话）"""
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(base, path))
+
+
 def _format_results(
     matches: list[tuple[str, int, str]],
     files: list[str],
@@ -73,21 +178,24 @@ def _format_results(
     limit: int,
     offset: int,
     truncated: bool,
+    base_dir: str = "",
 ) -> str:
     """将搜索结果格式化为字符串"""
     if output_mode == "files_only":
         if not files:
             return "未找到匹配的文件"
-        lines = files
+        # 转为绝对路径
+        abs_files = [_to_absolute(f, base_dir) for f in files]
+        lines = abs_files
         if truncated:
-            lines.append(f"... (共 {total_count} 个结果，仅显示 {len(files)} 个)")
+            lines.append(f"... (共 {total_count} 个结果，仅显示 {len(abs_files)} 个)")
         return "\n".join(lines)
 
     elif output_mode == "count":
         if not counts:
             return "未找到匹配的内容"
         total = sum(counts.values())
-        lines = [f"{path}: {cnt}" for path, cnt in sorted(counts.items(), key=lambda x: -x[1])]
+        lines = [f"{_to_absolute(p, base_dir)}: {cnt}" for p, cnt in sorted(counts.items(), key=lambda x: -x[1])]
         lines.append(f"\n共 {len(counts)} 个文件，{total} 处匹配")
         return "\n".join(lines)
 
@@ -96,8 +204,9 @@ def _format_results(
             return "未找到匹配的内容"
         lines = []
         for path, lineno, content in matches:
+            abs_path = _to_absolute(path, base_dir)
             display = content.strip()[:200]
-            lines.append(f"{path}:{lineno}: {display}")
+            lines.append(f"{abs_path}:{lineno}: {display}")
         if truncated:
             lines.append(f"... (共 {total_count} 条结果，显示第 {offset+1}-{offset+len(matches)} 条)")
         return "\n".join(lines)
@@ -354,6 +463,68 @@ def _search_content_python(
         }
 
 
+# ── 多目录搜索 ──────────────────────────────────────────
+
+def _search_single_dir(
+    pattern: str, directory: str, target: str,
+    file_glob: Optional[str], limit: int, offset: int,
+    output_mode: str, context: int,
+) -> str:
+    """在单个目录中搜索，返回格式化结果（绝对路径）"""
+    abs_dir = os.path.abspath(directory)
+
+    if target == "files":
+        if _has_rg():
+            result = _search_files_rg(pattern, abs_dir, limit, offset)
+            engine = "rg"
+        else:
+            result = _search_files_glob(pattern, abs_dir, limit, offset)
+            engine = "glob"
+
+        files = result.get("files", [])
+        total = result.get("total_count", 0)
+        truncated = result.get("truncated", False)
+
+        if not files:
+            return ""  # 空字符串表示无结果
+
+        abs_files = [_to_absolute(f, abs_dir) for f in files]
+        output = "\n".join(abs_files)
+        if truncated or total > len(files):
+            output += f"\n... (共 {total} 个结果，显示第 {offset+1}-{offset+len(files)} 个)"
+
+        logger.info(f"[search_files] files mode: engine={engine}, pattern={pattern}, dir={abs_dir}, total={total}")
+        return output
+
+    else:  # content mode
+        if _has_rg():
+            result = _search_content_rg(pattern, abs_dir, file_glob, limit, offset, output_mode, context)
+            engine = "rg"
+        elif _has_grep():
+            result = _search_content_grep(pattern, abs_dir, file_glob, limit, offset, output_mode, context)
+            engine = "grep"
+        else:
+            result = _search_content_python(pattern, abs_dir, file_glob, limit, offset, output_mode)
+            engine = "python"
+
+        if result.get("error"):
+            return f"[搜索错误] {result['error']}"
+
+        matches = result.get("matches", [])
+        files = result.get("files", [])
+        counts = result.get("counts", {})
+        total = result.get("total_count", 0)
+        truncated = result.get("truncated", False)
+
+        output = _format_results(matches, files, counts, output_mode, total, limit, offset, truncated, abs_dir)
+
+        if not matches and not files and not counts:
+            return ""  # 空字符串表示无结果
+
+        logger.info(f"[search_files] content mode: engine={engine}, pattern={pattern}, dir={abs_dir}, total={total}")
+        return output
+
+
 # ── 主入口 ──────────────────────────────────────────────
 
 class SearchFilesInput(BaseModel):
@@ -377,84 +548,90 @@ def _search_files_impl(
     output_mode: str = "content",
     context: int = 0,
 ) -> str:
-    """核心逻辑 — 搜索文件或文件内容"""
+    """核心逻辑 — 搜索文件或文件内容
+
+    改进：当默认目录无结果时，自动扫描多个候选工作目录（工作目录发现），
+    避免因 cwd 固定导致搜不到其他盘的项目文件。
+    """
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
     try:
+        abs_dir = os.path.abspath(directory)
+
+        # 第一步：在指定目录搜索
+        result = _search_single_dir(pattern, abs_dir, target, file_glob, limit, offset, output_mode, context)
+        if result:
+            return result
+
+        # 第二步：指定目录无结果 → 自动扩展搜索范围
+        # 只有当用户传的是默认值 "." 或相对路径时才扩展
+        is_default_dir = (directory == "." or directory == os.getcwd()
+                          or os.path.abspath(directory) == os.getcwd())
+
+        if not is_default_dir:
+            # 用户明确指定了目录，尊重选择
+            if target == "files":
+                return f"未找到匹配 '{pattern}' 的文件"
+            else:
+                return f"未在 '{directory}' 中找到匹配 '{pattern}' 的内容"
+
+        # 自动扫描多个候选目录
+        project_roots = _get_project_roots()
+        all_results = []
+        total_found = 0
+
+        for root_dir in project_roots:
+            if root_dir == abs_dir:
+                continue  # 已经搜过了
+            sub_result = _search_single_dir(
+                pattern, root_dir, target, file_glob,
+                max(limit - total_found, 5), 0, output_mode, context
+            )
+            if sub_result:
+                all_results.append((root_dir, sub_result))
+                # 估算结果数
+                total_found += sub_result.count('\n') + 1
+                if total_found >= limit:
+                    break
+
+        if all_results:
+            # 拼接多目录结果
+            parts = []
+            for root_dir, sub_result in all_results:
+                parts.append(f"📂 {root_dir}\n{sub_result}")
+            combined = "\n\n".join(parts)
+            if total_found > limit:
+                combined += f"\n\n... (结果已截断，可用 directory 参数指定目录精确搜索)"
+            return combined
+
+        # 完全无结果
+        # 列出可用目录帮助用户定位
+        available = [d for d in project_roots if os.path.isdir(d)]
+        hint = ""
+        if available:
+            dirs_str = "\n  ".join(available[:10])
+            hint = f"\n\n💡 可用搜索目录：\n  {dirs_str}\n  使用 directory=参数 指定搜索路径"
+
         if target == "files":
-            return _do_search_files(pattern, directory, limit, offset)
+            return f"未找到匹配 '{pattern}' 的文件{hint}"
         else:
-            return _do_search_content(pattern, directory, file_glob, limit, offset, output_mode, context)
+            return f"未在默认目录中找到匹配 '{pattern}' 的内容{hint}"
+
     except Exception as e:
         logger.error(f"[search_files] error: {e}", exc_info=True)
         return f"[错误] 搜索失败: {e}"
-
-
-def _do_search_files(pattern: str, directory: str, limit: int, offset: int) -> str:
-    """按文件名搜索"""
-    if _has_rg():
-        result = _search_files_rg(pattern, directory, limit, offset)
-        engine = "rg"
-    else:
-        result = _search_files_glob(pattern, directory, limit, offset)
-        engine = "glob"
-
-    files = result.get("files", [])
-    total = result.get("total_count", 0)
-    truncated = result.get("truncated", False)
-
-    if not files:
-        return f"未找到匹配 '{pattern}' 的文件"
-
-    output = "\n".join(files)
-    if truncated or total > len(files):
-        output += f"\n... (共 {total} 个结果，显示第 {offset+1}-{offset+len(files)} 个)"
-
-    logger.info(f"[search_files] files mode: engine={engine}, pattern={pattern}, total={total}")
-    return output
-
-
-def _do_search_content(
-    pattern: str, directory: str, file_glob: Optional[str],
-    limit: int, offset: int, output_mode: str, context: int,
-) -> str:
-    """按内容搜索"""
-    if _has_rg():
-        result = _search_content_rg(pattern, directory, file_glob, limit, offset, output_mode, context)
-        engine = "rg"
-    elif _has_grep():
-        result = _search_content_grep(pattern, directory, file_glob, limit, offset, output_mode, context)
-        engine = "grep"
-    else:
-        result = _search_content_python(pattern, directory, file_glob, limit, offset, output_mode)
-        engine = "python"
-
-    if result.get("error"):
-        return f"[搜索错误] {result['error']}"
-
-    matches = result.get("matches", [])
-    files = result.get("files", [])
-    counts = result.get("counts", {})
-    total = result.get("total_count", 0)
-    truncated = result.get("truncated", False)
-
-    output = _format_results(matches, files, counts, output_mode, total, limit, offset, truncated)
-
-    if not matches and not files and not counts:
-        return f"未在 '{directory}' 中找到匹配 '{pattern}' 的内容"
-
-    logger.info(f"[search_files] content mode: engine={engine}, pattern={pattern}, total={total}")
-    return output
 
 
 search_files = build_tool(
     name="search_files",
     description=(
         "搜索文件或文件内容。优先使用 ripgrep 加速，自动回退。\n"
+        "当默认目录无结果时，自动扫描本机所有项目目录。\n"
+        "结果始终返回绝对路径，可直接用于 read_file。\n"
         "Args:\n"
         "  pattern: 搜索模式(target='files'时为文件名匹配，target='content'时为正则)\n"
-        "  directory: 搜索目录，默认当前目录\n"
+        "  directory: 搜索目录，默认当前目录（无结果时自动扩展）\n"
         "  target: 'files'按文件名 / 'content'按内容(默认files)\n"
         "  file_glob: 限定文件类型(如*.py)\n"
         "  limit: 结果数量上限(默认50)\n"

@@ -39,18 +39,50 @@ class CleanupTmpInput(BaseModel):
 # ── read_file ──
 
 def _read_file_impl(path: str, encoding: str = "utf-8") -> str:
-    """核心逻辑 — 不做手动截断，交给框架"""
+    """核心逻辑 — 不做手动截断，交给框架
+    
+    改进（借鉴 Hermes）：
+    - 文件不存在时，尝试在常见项目目录中搜索同名文件
+    - 返回绝对路径提示，帮助 LLM 定位
+    """
     try:
-        with open(path, "r", encoding=encoding, errors="replace") as f:
+        # 尝试解析路径：如果是相对路径，先转绝对路径
+        abs_path = os.path.abspath(path)
+        
+        with open(abs_path, "r", encoding=encoding, errors="replace") as f:
             content = f.read()
 
         # 记录到 FileStateCache（Read-Before-Edit 核心）
         cache = get_file_state_cache()
-        cache.record_read(path, content)
+        cache.record_read(abs_path, content)
 
         return content
     except FileNotFoundError:
-        return f"[错误] 文件不存在: {path}"
+        # 文件不存在 → 给出路径提示
+        hint = ""
+        abs_path = os.path.abspath(path)
+        
+        # 如果是相对路径拼错了，提示用绝对路径
+        if not os.path.isabs(path):
+            hint = f"\n\n💡 提示：当前工作目录为 {os.getcwd()}，相对路径解析为 {abs_path}\n" \
+                   f"如果文件在其他位置，请使用绝对路径或先用 search_files 搜索。"
+        else:
+            # 绝对路径也不存在 → 检查父目录是否存在
+            parent = os.path.dirname(abs_path)
+            if os.path.isdir(parent):
+                # 父目录存在，文件名可能拼错，列出相似文件
+                fname = os.path.basename(path)
+                try:
+                    similar = [f for f in os.listdir(parent) 
+                               if fname.lower() in f.lower() or f.lower() in fname.lower()]
+                    if similar:
+                        hint = f"\n\n💡 父目录存在，相似文件：\n  " + "\n  ".join(similar[:5])
+                except (OSError, PermissionError):
+                    pass
+            else:
+                hint = f"\n\n💡 提示：目录 {parent} 不存在。请先用 search_files 搜索文件。"
+        
+        return f"[错误] 文件不存在: {path}{hint}"
     except Exception as e:
         return f"[错误] 读取失败: {e}"
 
