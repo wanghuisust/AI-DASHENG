@@ -128,9 +128,10 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
 
     try:
         with httpx.Client(timeout=httpx.Timeout(1800.0, connect=10.0)) as client:
-            with client.stream("POST", url, json=payload) as resp:
+            with client.stream("POST", url, json=payload, headers={"Accept": "text/event-stream"}) as resp:
                 response_text = ""
-                logger.debug(f"[SSE] Connected to {url}, reading events...")
+                event_received = False  # 追踪是否收到过任何有效事件
+                logger.info(f"[SSE] Connected to {url}, reading events...")
                 event_type = ""
                 for line_bytes in resp.iter_lines():
                     line = line_bytes.decode("utf-8", errors="replace").strip() if isinstance(line_bytes, bytes) else line_bytes.strip()
@@ -149,6 +150,7 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                             logger.debug(f"[SSE] non-json data: {data_str[:100]}")
                             continue
 
+                        event_received = True  # 收到过有效事件，说明 SSE 流确实传回了数据
                         logger.debug(f"[SSE] {event_type}: {json.dumps(data, ensure_ascii=False)[:200]}")
 
                         if event_type == "text_delta":
@@ -248,7 +250,11 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                                 except Exception as e:
                                     logger.warning(f"[on_status] tool_error 回调异常: {e}")
                         elif event_type == "result":
-                            response_text = data.get("response", "")
+                            # result 是最终回复，优先使用其 response 字段
+                            # 如果 result.response 为空但 streaming_text 已有内容，保留已拼接的文本
+                            api_response = data.get("response", "")
+                            if api_response:
+                                response_text = api_response
                             # 收到最终回复，清掉 thinking 类的 pending steps
                             if on_status:
                                 try:
@@ -256,6 +262,7 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                                 except Exception:
                                     pass
                             # result 是最终回复，收到后立即跳出
+                            logger.info(f"[SSE] 收到 result 事件")
                             break
                         elif event_type == "text_reset":
                             # LLM 一轮结束，_current_llm_text 重置为空，gateway 也要重置 streaming 位置
@@ -271,6 +278,35 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                         elif event_type == "error":
                             logger.error(f"[Agent SSE] 错误: {data.get('message', '')}")
                             response_text = f"抱歉，处理消息时出错: {data.get('message', '')}"
+
+                # ── SSE 流结束后的兜底逻辑 ──
+                # 如果 response_text 为空但收到过有效事件（说明 Agent 执行了但结果丢失），
+                # 尝试从线程历史恢复最终结果
+                if not response_text and event_received:
+                    logger.warning(f"[SSE] response_text 为空但收到过事件，尝试从线程历史恢复")
+                    try:
+                        history_url = f"{DASHENG_API}/v1/threads/{message.chat_id}"
+                        with httpx.Client(timeout=10.0) as hist_client:
+                            hist_resp = hist_client.get(history_url)
+                            if hist_resp.status_code == 200:
+                                hist_data = hist_resp.json()
+                                msgs = hist_data.get("messages", [])
+                                # 找最后一条 AI 消息
+                                for msg in reversed(msgs):
+                                    role = msg.get("role", msg.get("type", ""))
+                                    content = msg.get("content", "")
+                                    if role in ("ai", "assistant") and content:
+                                        response_text = content
+                                        logger.info(f"[SSE] 从线程历史恢复回复: {content[:80]}...")
+                                        break
+                    except Exception as e:
+                        logger.warning(f"[SSE] 从线程历史恢复失败: {e}")
+
+                # 如果仍然为空，给出通用提示
+                if not response_text:
+                    logger.warning(f"[SSE] response_text 仍为空（event_received={event_received}）")
+                    return "抱歉，任务已完成但未能获取回复，请重试。"
+
         return response_text
     except httpx.TimeoutException:
         logger.error(f"[Agent SSE] 连接超时: {url}")
@@ -616,8 +652,25 @@ def _process_and_reply(message: PlatformMessage):
 
         # ── 微信增量推送状态 ──
         _streaming_text_sent = [0]       # 已推送的文本字符数
+
+        # ── QQ 平台：任务开始后发送"正在处理"指示 ──
+        _qq_working_sent = [False]  # 追踪是否已发送过 QQ 的"正在处理"消息
+        if message.platform == "qq" and not message.is_group:
+            # QQ 没有 typing 机制，任务开始后发一条指示消息
+            try:
+                work_reply = PlatformReply(
+                    platform="qq",
+                    chat_id=message.chat_id,
+                    text="⏳ 正在处理中，请稍候...",
+                    is_group=False,
+                )
+                qq_adapter.send_reply(work_reply)
+                _qq_working_sent[0] = True
+                logger.info(f"[QQ] 发送工作指示消息")
+            except Exception as e:
+                logger.warning(f"[QQ] 发送工作指示消息失败: {e}")
         _streaming_last_push = [0.0]     # 上次推送时间戳
-        STREAMING_PUSH_MIN_CHARS = 300   # 最少累积 300 字才推（增大单次推送量，减少碎片消息）
+        STREAMING_PUSH_MIN_CHARS = 400   # 最少累积 400 字才推（增大单次推送量，减少碎片消息）
         STREAMING_PUSH_MIN_INTERVAL = 3.0  # 两次推送最少间隔 3 秒
 
         # ── 工具自然语言描述映射（Hermes 风格：半思考半行动）──
@@ -828,6 +881,20 @@ def _process_and_reply(message: PlatformMessage):
 
             # ── 构造步骤条目 ──
             if step == "tool_call":
+                # ── QQ 首次工具调用时发送工作指示（如果没有已发送过） ──
+                if message.platform == "qq" and _qq_working_sent[0] == False:
+                    try:
+                        work_reply = PlatformReply(
+                            platform="qq",
+                            chat_id=message.chat_id,
+                            text=f"🔧 正在调用工具中，请稍候...",
+                            is_group=message.is_group,
+                        )
+                        _target.send_reply(work_reply)
+                        _qq_working_sent[0] = True
+                        logger.info(f"[QQ] 首次工具调用工作指示")
+                    except Exception as e:
+                        logger.warning(f"[QQ] 工作指示发送失败: {e}")
                 _pending_steps.append({"type": "tool_call", "tool": tool, "args": data.get("args", {})})
             elif step == "tool_done":
                 # 工具结果，取前500字用于智能摘要（不能只取100字，否则行数统计不准）
@@ -890,7 +957,18 @@ def _process_and_reply(message: PlatformMessage):
             wechat_typing_thread.join(timeout=3)
 
         if not reply_text:
-            logger.warning(f"[{message.platform}] Agent 返回空回复")
+            logger.error(f"[{message.platform}] Agent 返回空回复 — 发送兜底消息")
+            try:
+                fallback = PlatformReply(
+                    platform=message.platform,
+                    chat_id=message.chat_id,
+                    text="抱歉，任务处理过程中出现异常，未能获取回复。请重试。",
+                    is_group=message.is_group,
+                    at_user=message.user_id,
+                )
+                _target.send_reply(fallback)
+            except Exception as e:
+                logger.error(f"[{message.platform}] 兜底消息发送失败: {e}")
             return
 
         logger.info(f"[{message.platform}] Agent 回复: {reply_text[:80]}...")
