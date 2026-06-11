@@ -705,6 +705,7 @@ TOOL_TIMEOUT_SECONDS = 20
 # 对于已知耗时的工具（如 terminal_execute 自带 timeout 参数），给更长窗口
 _TOOL_TIMEOUT_OVERRIDE = {
     "terminal_execute": 30,  # 终端命令自带 timeout 参数，但整体也要限制
+    "disk_analyze": 60,      # 磁盘扫描需要更多时间，os.walk遍历大目录
 }
 
 # 工具执行最大等待次数（防止有进展但永远不结束的情况）
