@@ -839,17 +839,10 @@ def _process_and_reply(message: PlatformMessage):
                 return
 
 # ── streaming_text：LLM 逐 token 输出，增量推送给客户端 ──
-            # QQ 只推工具进度，不推 LLM 中间文本，最终结果一次性发完整回复
-            # 微信保留 streaming 推送（微信有 typing 机制，体验好）
             if step == "streaming_text":
                 full_text = data.get("text", "")
                 if not full_text:
                     return
-                # QQ 跳过中间文本推送，只记录位置用于判断最终是否需要发送
-                if message.platform == "qq":
-                    _streaming_text_sent[0] = len(full_text)
-                    return
-                # 微信：增量推送
                 sent = _streaming_text_sent[0]
                 new_chars = len(full_text) - sent
                 elapsed = now - _streaming_last_push[0]
@@ -989,17 +982,13 @@ def _process_and_reply(message: PlatformMessage):
 
         if _target:
             # ── 发送最终回复 ──
-            # QQ：不推中间文本，直接发完整回复
-            # 微信：streaming 已推送部分文本，只发剩余部分避免重复
+            # streaming 已推送部分文本，检测最终回复是否与已推送内容重复
             streaming_sent = _streaming_text_sent[0]
-            if message.platform == "qq" or streaming_sent == 0:
-                # QQ 或无 streaming 推送：发完整回复
-                try:
-                    _target.send_reply(reply)
-                except Exception as e:
-                    logger.error(f"{message.platform}发送回复异常: {e}")
-            elif streaming_sent < len(reply_text):
-                # 微信：已有 streaming 推送，只发尚未推送的部分
+            if streaming_sent > 0 and streaming_sent >= len(reply_text):
+                # 已推送内容覆盖了最终回复，不再重复发
+                logger.info(f"[{message.platform}-streaming] streaming_sent={streaming_sent} >= reply_text_len={len(reply_text)}，跳过最终消息（已推送）")
+            elif streaming_sent > 0 and streaming_sent < len(reply_text):
+                # 已推送部分，只发剩余部分
                 remaining = reply_text[streaming_sent:].strip()
                 if remaining:
                     try:
@@ -1017,8 +1006,11 @@ def _process_and_reply(message: PlatformMessage):
                 else:
                     logger.info(f"[{message.platform}-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
             else:
-                # 微信：streaming 已推送超过 reply_text 长度，跳过
-                logger.info(f"[{message.platform}-streaming] streaming_sent={streaming_sent} >= reply_text_len={len(reply_text)}，跳过最终消息（已推送）")
+                # 无 streaming 推送，发完整回复
+                try:
+                    _target.send_reply(reply)
+                except Exception as e:
+                    logger.error(f"{message.platform}发送回复异常: {e}")
         else:
             logger.warning(f"{message.platform}消息但适配器未启动，无法回复")
     except Exception as e:
