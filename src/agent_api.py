@@ -148,6 +148,24 @@ def get_messages(thread_id: str) -> list:
                     if not tool_call_id:
                         tool_call_id = f"restored_{m.get('tool_name', 'unknown')}_{int(time.time())}"
                     restored.append(ToolMessage(content=content, name=m.get("tool_name", ""), tool_call_id=tool_call_id))
+            
+            # ── 清理尾部失败消息：避免下次请求被旧的超时/失败消息误导 ──
+            # 从末尾往前找，如果连续是 tool 超时/失败/guardrail-block 的消息，截断掉
+            _FAIL_MARKERS = ("[工具超时]", "已去重)", "[工具循环", "[stderr]", "[exit code: 1]", 
+                             '"action": "block"', "repeated_exact_failure", "same_tool_failure", "idempotent")
+            while restored:
+                last = restored[-1]
+                # 末尾是 AI 消息但带 tool_calls（说明任务未完成就中断了）
+                if isinstance(last, AIMessage) and last.tool_calls:
+                    restored.pop()
+                    continue
+                # 末尾是 tool 消息且内容含失败标记
+                if isinstance(last, ToolMessage) and any(mk in (last.content or "") for mk in _FAIL_MARKERS):
+                    restored.pop()
+                    continue
+                # 末尾是 AI 消息且不带 tool_calls（正常结束）或 human 消息 → 保留，停止
+                break
+            
             thread_messages[thread_id] = restored
             print(f"[RESTORE] Restored {len(restored)} messages for thread {thread_id}")
         else:
