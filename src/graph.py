@@ -1249,24 +1249,11 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
     _gr = _get_tool_guardrail()
     halt = _gr.halt_decision
     if halt is not None:
-        print(f"[{_ts}] [GUARDRAIL-HALT] {halt.tool_name}: {halt.code} (count={halt.count})", flush=True)
-        last_message.tool_calls = []
-        # HALT 时做一次无工具总结，避免用户只看到中间轮碎片文本
-        halt_reason = f"{halt.tool_name} 连续失败 {halt.count} 次，已停止尝试该工具"
-        summary = _halt_summarize(state["messages"], halt_reason)
-        halt_hint = f"\n\n⚠️ 操作受限：{halt_reason}。"
-        if summary:
-            last_message.content = summary + halt_hint
-            print(f"[{_ts}] [GUARDRAIL-HALT] 总结完成: {last_message.content[:80]}...", flush=True)
-        else:
-            last_message.content = (
-                f"{halt.tool_name} 连续失败 {halt.count} 次，"
-                "请换一种完全不同的方式（例如换一个完全不同的工具、换一个完全不同的思路），"
-                "或者告诉我具体要做什么，我来想办法。"
-            )
-        return "end"
+        # 注意：should_continue是条件边函数，直接修改state不会持久化
+        # 所以返回"halt"路由到专门的halt_node处理
+        return "halt"
 
-    # ── 兜底安全上限：只计数本次请求新增的工具调用 ──
+    # ── 进度感知超时检查 ──
     # 防止 guardrail 阈值宽松时 LLM 一直在"进步"但永远不会停
     # 注意：恢复的历史消息中的工具调用不算本次，避免旧历史吃掉额度
     start_idx = state.get("session_start_index", 0)
@@ -1279,17 +1266,50 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
     print(f"[{_ts}] [LIMIT-CHECK] start_idx={start_idx} total_msgs={total_msgs} session_tools={session_tool_results}/{ABSOLUTE_TOOL_LIMIT}", flush=True)
     if session_tool_results >= ABSOLUTE_TOOL_LIMIT:
         print(f"[{_ts}] [ABSOLUTE-LIMIT] 本次工具调用次数 {session_tool_results} 达到上限 {ABSOLUTE_TOOL_LIMIT}", flush=True)
-        last_message.tool_calls = []
-        limit_reason = "本次对话的工具调用次数已达上限，已自动停止"
-        summary = _halt_summarize(state["messages"], limit_reason)
-        limit_hint = f"\n\n⚠️ {limit_reason}。"
-        if summary:
-            last_message.content = summary + limit_hint
-        else:
-            last_message.content = "抱歉，本次对话的工具调用次数已达上限，已自动停止。请总结当前进展后重新开始。"
-        return "end"
+        # 把 ABSOLUTE-LIMIT halt 信息存到 guardrail，让 halt_node 统一处理
+        _gr = _get_tool_guardrail()
+        _gr._set_halt(_GuardrailDecision(
+            action="halt",
+            code="absolute_tool_limit",
+            message=f"本次对话的工具调用次数已达上限 {ABSOLUTE_TOOL_LIMIT}，已自动停止",
+            tool_name="*",
+            count=session_tool_results,
+        ))
+        return "halt"
 
     return "tools"
+
+
+def halt_node(state: AgentState) -> dict:
+    """guardrail halt 专用节点：清空 tool_calls、生成总结回复
+    should_continue 是条件边函数，对 state 的修改不会持久化，
+    所以 halt 处理逻辑移到此 graph node 中。
+    """
+    import datetime as _dt
+    _ts = _dt.datetime.now().strftime("%H:%M:%S")
+    _gr = _get_tool_guardrail()
+    halt = _gr.halt_decision
+    if halt is None:
+        # guardrail 已经被 reset（不应该走到这里）
+        return {"messages": []}
+
+    print(f"[{_ts}] [GUARDRAIL-HALT] {halt.tool_name}: {halt.code} (count={halt.count})", flush=True)
+    halt_reason = f"{halt.tool_name} 连续失败 {halt.count} 次，已停止尝试该工具"
+    summary = _halt_summarize(state["messages"], halt_reason)
+    halt_hint = f"\n\n⚠️ 操作受限：{halt_reason}。"
+
+    if summary:
+        content = summary + halt_hint
+        print(f"[{_ts}] [GUARDRAIL-HALT] 总结完成: {content[:80]}...", flush=True)
+    else:
+        content = (
+            f"{halt.tool_name} 连续失败 {halt.count} 次，"
+            "请换一种完全不同的方式（例如换一个完全不同的工具、换一个完全不同的思路），"
+            "或者告诉我具体要做什么，我来想办法。"
+        )
+
+    # 用 AIMessage 替代最后一条（含 tool_calls 的中间碎片），确保持久化
+    return {"messages": [AIMessage(content=content)]}
 
 
 # ── 构建图 ──────────────────────────────────────────────────
@@ -1310,9 +1330,11 @@ def build_graph(llm=None, cancel_event: threading.Event = None):
     graph = StateGraph(AgentState)
     graph.add_node("agent", lambda state: agent_node(state, llm, cancel_event))
     graph.add_node("tools", tool_node_with_timeout)
+    graph.add_node("halt", halt_node)
     graph.set_entry_point("agent")
-    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
+    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "halt": "halt", "end": END})
     graph.add_edge("tools", "agent")
+    graph.add_edge("halt", END)
 
     return graph.compile()
 
