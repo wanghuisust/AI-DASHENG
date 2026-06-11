@@ -1,30 +1,47 @@
-"""上下文压缩 — 对话过长时自动摘要，节省 token（借鉴 Hermes Agent 方案）
+"""上下文压缩 — 对话过长时自动摘要，节省 token
 
-策略（对标 Hermes ContextCompressor）：
-  Phase 1: 工具输出预处理 — 去重、截断冗长的工具返回
-  Phase 2: 边界计算 — 基于 token 预算，而非固定消息条数
-  Phase 3: LLM 结构化摘要 — 增量更新，保留关键上下文
-  Phase 4: 回退 — LLM 不可用时简单摘要兜底
+融合 Hermes Agent 的精确压缩策略 + Dasheng 的工具预处理和增量摘要：
 
-与旧版区别：
-  - 旧版：固定保留最近 6 条，不区分工具输出，简单截断
-  - 新版：基于 token 预算动态分割，工具输出先瘦身，LLM 生成结构化摘要
+策略：
+  Phase 1: 工具输出预处理 — 去重、分类截断冗长的工具返回  [Dasheng保留]
+  Phase 2: 受保护区域标记 — 第一条消息 + 最后N条  [借鉴Hermes]
+  Phase 3: 边界保护 — 防止切断 tool response 对  [借鉴Hermes]
+  Phase 4: 基于token预算的压缩区域计算  [借鉴Hermes]
+  Phase 5: LLM 结构化摘要（增量更新）+ 重试容错  [融合两者]
+  Phase 6: 回退 — 简单摘要兜底  [Dasheng保留]
 """
 
 import hashlib
 import json as _json
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+import time
+import random
+import logging
+from typing import List, Tuple, Optional
+from langchain_core.messages import (
+    SystemMessage, HumanMessage, AIMessage, ToolMessage,
+)
 from constants import estimate_tokens, get_compress_threshold, get_max_context_tokens
 
+logger = logging.getLogger(__name__)
+
 # ── 可调参数 ──
-TAIL_TOKEN_RATIO = 0.30    # 尾部保留区占总预算的比例（Hermes: ~30%）
-MIN_TAIL_MESSAGES = 4      # 尾部最少保留的消息条数
-SUMMARY_MAX_CHARS = 3000   # LLM 摘要最大字符数
+TAIL_TOKEN_RATIO = 0.3       # 尾部保留区占总预算的比例 (Hermes: ~30%)
+MIN_TAIL_MESSAGES = 4        # 尾部最少保留的消息条数
+PROTECT_LAST_N = 4           # 保护最后N条turn (Hermes默认)
+SUMMARY_TARGET_TOKENS = 750  # 摘要目标token数
+SUMMARY_MAX_CHARS = 3000     # 摘要最大字符数
 TOOL_OUTPUT_MAX_CHARS = 500  # 工具输出预处理后最大字符数
+SUMMARY_MAX_RETRIES = 3      # 摘要生成最大重试次数
+SUMMARY_BASE_DELAY = 2.0     # 摘要重试基础延迟(秒)
+CONTENT_TRUNCATE_CHARS = 3000 # 摘要prompt内单turn内容截断长度
+CONTENT_TRUNCATE_HEAD = 1500 # 截断时保留头部字符数
+CONTENT_TRUNCATE_TAIL = 500  # 截断时保留尾部字符数
+
+SUMMARY_PREFIX = "[CONTEXT SUMMARY]"
 
 
 # ═══════════════════════════════════════════════════════════
-# Phase 1: 工具输出预处理
+# Phase 1: 工具输出预处理 (Dasheng原有，保留)
 # ═══════════════════════════════════════════════════════════
 
 def _content_hash(text: str) -> str:
@@ -36,26 +53,21 @@ def _summarize_tool_output(name: str, content: str) -> str:
     """将冗长的工具输出压缩为一行摘要"""
     if not content:
         return content
-    # 如果已经够短，直接返回
     if len(content) <= TOOL_OUTPUT_MAX_CHARS:
         return content
 
-    # 工具名到摘要策略的映射
     name_lower = (name or "").lower()
 
-    # 搜索/列表类：只保留前几行 + 行数统计
     if any(kw in name_lower for kw in ["search", "find", "list", "glob", "ls"]):
         lines = content.strip().split("\n")
         kept = "\n".join(lines[:8])
         return f"{kept}\n... (共 {len(lines)} 行，已省略)"
 
-    # 读取文件类：只保留前几行
     if any(kw in name_lower for kw in ["read", "cat", "head"]):
         lines = content.strip().split("\n")
         kept = "\n".join(lines[:10])
         return f"{kept}\n... (共 {len(lines)} 行，已省略)"
 
-    # 终端命令类：保留最后几行（通常包含结果）
     if any(kw in name_lower for kw in ["terminal", "shell", "exec", "bash"]):
         lines = content.strip().split("\n")
         if len(lines) <= 15:
@@ -63,18 +75,12 @@ def _summarize_tool_output(name: str, content: str) -> str:
         kept = "\n".join(lines[:3] + ["..."] + lines[-5:])
         return f"{kept}\n... (共 {len(lines)} 行，已省略)"
 
-    # 通用：截断到最大长度
     return content[:TOOL_OUTPUT_MAX_CHARS] + "\n... (已截断)"
 
 
 def _prune_tool_outputs(messages: list) -> list:
-    """预处理工具输出：去重 + 截断冗长返回
-
-    类似 Hermes 的 _prune_old_tool_outputs，但简化为：
-    1. 同名工具相同输出的重复调用只保留第一次
-    2. 超长工具输出截断
-    """
-    seen_tool_hashes = {}  # (tool_name, output_hash) → first_index
+    """预处理工具输出：去重 + 截断冗长返回"""
+    seen_tool_hashes = {}
     result = []
 
     for i, msg in enumerate(messages):
@@ -88,7 +94,6 @@ def _prune_tool_outputs(messages: list) -> list:
 
         key = (tool_name, output_hash)
         if key in seen_tool_hashes:
-            # 重复的工具输出，替换为简短引用
             first_idx = seen_tool_hashes[key]
             new_msg = ToolMessage(
                 content=f"(同第 {first_idx + 1} 条消息的 {tool_name} 输出，已去重)",
@@ -98,7 +103,6 @@ def _prune_tool_outputs(messages: list) -> list:
             result.append(new_msg)
         else:
             seen_tool_hashes[key] = i
-            # 截断超长输出
             trimmed = _summarize_tool_output(tool_name, content)
             if trimmed != content:
                 new_msg = ToolMessage(
@@ -114,68 +118,156 @@ def _prune_tool_outputs(messages: list) -> list:
 
 
 # ═══════════════════════════════════════════════════════════
-# Phase 2: 边界计算 — 基于 token 预算
+# Phase 2: 受保护区域标记 (借鉴Hermes)
 # ═══════════════════════════════════════════════════════════
 
-def _find_tail_boundary(messages: list, budget: int) -> int:
-    """从消息列表末尾往前扫描，找到 token 预算内的分割点
+def _find_protected_indices(messages: list) -> Tuple[set, int, int]:
+    """
+    找出受保护的消息索引。
+
+    保护：
+    - 第一条 system / human / ai / tool 消息
+    - 最后 N 条消息
 
     Returns:
-        分割索引：messages[:split] 是旧消息（待摘要），messages[split:] 是尾部保留
+        (protected_set, compress_start, compress_end)
+        compressible region = messages[compress_start:compress_end]
     """
-    tail_tokens = 0
-    split = len(messages)
+    n = len(messages)
+    protected = set()
 
-    for i in range(len(messages) - 1, -1, -1):
+    first_system = first_human = first_ai = first_tool = None
+
+    for i, msg in enumerate(messages):
+        role = getattr(msg, "type", "")
+        if role == "system" and first_system is None:
+            first_system = i
+        elif role == "human" and first_human is None:
+            first_human = i
+        elif role == "ai" and first_ai is None:
+            first_ai = i
+        elif role == "tool" and first_tool is None:
+            first_tool = i
+
+    # 保护第一条各类型消息
+    if first_system is not None:
+        protected.add(first_system)
+    if first_human is not None:
+        protected.add(first_human)
+    if first_ai is not None:
+        protected.add(first_ai)
+    if first_tool is not None:
+        protected.add(first_tool)
+
+    # 保护最后N条
+    for i in range(max(0, n - PROTECT_LAST_N), n):
+        protected.add(i)
+
+    # 确定可压缩区域
+    half = n // 2
+    head_protected = sorted(i for i in protected if i < half)
+    tail_protected = sorted(i for i in protected if i >= half)
+
+    compress_start = max(head_protected) + 1 if head_protected else 0
+    compress_end = min(tail_protected) if tail_protected else n
+
+    return protected, compress_start, compress_end
+
+
+# ═══════════════════════════════════════════════════════════
+# Phase 3: 边界保护 (借鉴Hermes _snap_boundary)
+# ═══════════════════════════════════════════════════════════
+
+def _is_boundary_clean(messages: list, idx: int) -> bool:
+    """
+    边界在idx处是干净的，不会切断 tool response 对。
+
+    在from/value格式中，tool turn 紧跟在其对应的ai turn之后。
+    如果边界落在tool turn上，意味着把tool的response从上下文中切掉了。
+    边界干净的条件：idx越界 或 idx处的消息不是tool turn。
+    """
+    return idx >= len(messages) or getattr(messages[idx], "type", "") != "tool"
+
+
+def _snap_boundary(messages: list, idx: int, min_idx: int, max_idx: int) -> int:
+    """
+    将压缩边界移动到最近的干净边界。
+
+    优先向前移动（把孤立的tool turn纳入压缩区），
+    如果前方没有干净边界，则向后回退。
+    """
+    # 向前找干净边界
+    forward = idx
+    while forward < max_idx and not _is_boundary_clean(messages, forward):
+        forward += 1
+    if _is_boundary_clean(messages, forward):
+        return forward
+
+    # 向后回退找干净边界
+    backward = idx
+    while backward > min_idx and not _is_boundary_clean(messages, backward):
+        backward -= 1
+    return backward
+
+
+# ═══════════════════════════════════════════════════════════
+# Phase 4: Token计算 & 压缩区域选择 (借鉴Hermes)
+# ═══════════════════════════════════════════════════════════
+
+def _msg_tokens(msg) -> int:
+    """估算单条消息的token数"""
+    content = ""
+    if hasattr(msg, "content") and msg.content:
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+    if hasattr(msg, "tool_calls") and msg.tool_calls:
+        content += _json.dumps(msg.tool_calls, ensure_ascii=False, default=str)
+    return estimate_tokens(content) + 10
+
+
+def _count_trajectory_tokens(messages: list) -> int:
+    """计算总token数"""
+    return sum(_msg_tokens(m) for m in messages)
+
+
+def _extract_turn_content_for_summary(
+    messages: list, start: int, end: int
+) -> str:
+    """提取待摘要的消息内容，用于LLM摘要prompt"""
+    parts = []
+    for i in range(start, end):
         msg = messages[i]
-        content = ""
+        role = getattr(msg, "type", "unknown")
+        value = ""
         if hasattr(msg, "content") and msg.content:
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            content += _json.dumps(msg.tool_calls, ensure_ascii=False, default=str)
-        msg_tokens = estimate_tokens(content) + 10
-
-        if tail_tokens + msg_tokens > budget:
-            break
-        tail_tokens += msg_tokens
-        split = i
-
-    # 确保至少保留 MIN_TAIL_MESSAGES 条
-    split = min(split, len(messages) - MIN_TAIL_MESSAGES)
-    split = max(split, 0)  # 不能为负
-
-    return split
+            value = msg.content if isinstance(msg.content, str) else str(msg.content)
+        # 借鉴Hermes: 长内容保留首尾
+        if len(value) > CONTENT_TRUNCATE_CHARS:
+            value = value[:CONTENT_TRUNCATE_HEAD] + "\n...[truncated]...\n" + value[-CONTENT_TRUNCATE_TAIL:]
+        parts.append(f"[Turn {i} - {role.upper()}]:\n{value}")
+    return "\n\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════
-# Phase 3: LLM 结构化摘要（增量更新）
+# Phase 5: LLM结构化摘要 + 重试容错 (融合两者)
 # ═══════════════════════════════════════════════════════════
 
-# 结构化摘要模板（对标 Hermes 的 summary template）
-SUMMARY_TEMPLATE = """请将以下对话历史压缩为结构化摘要。摘要将用于后续对话的上下文注入。
+SUMMARY_TEMPLATE = """Summarize the following agent conversation turns concisely. This summary will replace these turns in the conversation history.
 
-请按以下格式输出（每个部分简洁，1-3 行）：
+Write the summary from a neutral perspective describing what the assistant did and learned. Include:
+1. What actions the assistant took (tool calls, searches, file operations)
+2. Key information or results obtained
+3. Any important decisions or findings
+4. Relevant data, file names, values, or outputs
 
-## 活跃任务
-（用户当前正在做什么）
+Keep the summary factual and informative. Target approximately {summary_target_tokens} tokens.
 
-## 关键结论
-（对话中已确认的重要事实或决策）
+---
+TURNS TO SUMMARIZE:
+{content}
+---
 
-## 已完成操作
-（已执行的关键工具调用和结果，按时间简述）
+Write only the summary, starting with "{summary_prefix}:" prefix."""
 
-## 待解决事项
-（尚未完成或有争议的问题）
-
-## 关键文件/路径
-（对话中涉及的文件路径、URL、配置等）
-
-对话历史：
-{history}
-"""
-
-# 增量更新模板（已有旧摘要时使用）
 INCREMENTAL_TEMPLATE = """你是一个对话摘要助手。下面有一段旧摘要和一段新的对话记录。
 请将新信息合并到旧摘要中，更新各部分内容。如果旧摘要中的信息不再相关，可以删除。
 保持每个部分简洁（1-3 行），总长度不超过 {max_chars} 字符。
@@ -189,12 +281,30 @@ INCREMENTAL_TEMPLATE = """你是一个对话摘要助手。下面有一段旧摘
 请输出更新后的完整摘要（保持原有的 ## 标题结构）：
 """
 
-# 前缀标记：标识这是压缩摘要，不是当前对话
-SUMMARY_PREFIX = "[CONTEXT SUMMARY — 这是之前对话的压缩摘要，不是当前对话内容]"
+FALLBACK_SUMMARY = "[CONTEXT SUMMARY]: [摘要生成失败 — 之前的工具调用和响应已被压缩以节省上下文空间。]"
+
+
+def _jittered_backoff(attempt: int, base_delay: float = SUMMARY_BASE_DELAY, max_delay: float = 30.0) -> float:
+    """指数退避 + 抖动，防止并发重试风暴"""
+    exponent = max(0, attempt - 1)
+    delay = min(base_delay * (2 ** exponent), max_delay)
+    jitter = random.uniform(0, 0.5 * delay)
+    return delay + jitter
+
+
+def _find_existing_summary(messages: list) -> tuple:
+    """查找已有的摘要消息"""
+    for i, msg in enumerate(messages):
+        if hasattr(msg, "type") and msg.type == "system":
+            content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+            if SUMMARY_PREFIX in content:
+                body = content.split(SUMMARY_PREFIX, 1)[-1].strip()
+                return i, body
+    return -1, ""
 
 
 def _messages_to_text(messages: list) -> str:
-    """把消息列表转为可读文本（用于 LLM 摘要输入）"""
+    """把消息列表转为可读文本（用于增量摘要输入）"""
     lines = []
     for msg in messages:
         role = getattr(msg, "type", "unknown")
@@ -207,17 +317,16 @@ def _messages_to_text(messages: list) -> str:
         elif role == "ai":
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 for tc in msg.tool_calls:
-                    args_str = _json.dumps(tc["args"], ensure_ascii=False, default=str)
+                    args_str = _json.dumps(tc.get("args", {}), ensure_ascii=False, default=str)
                     if len(args_str) > 200:
                         args_str = args_str[:200] + "..."
-                    lines.append(f"AI调用工具: {tc['name']}({args_str})")
+                    lines.append(f"AI调用工具: {tc.get('name', 'tool')}({args_str})")
             if content:
                 lines.append(f"AI: {content[:500]}")
         elif role == "tool":
             name = getattr(msg, "name", "tool")
             lines.append(f"工具[{name}]返回: {content[:300]}")
         elif role == "system":
-            # 旧摘要直接保留
             lines.append(f"[旧摘要]: {content[:1000]}")
         else:
             lines.append(f"{role}: {content[:200]}")
@@ -225,79 +334,82 @@ def _messages_to_text(messages: list) -> str:
     return "\n".join(lines)
 
 
-def _find_existing_summary(messages: list) -> tuple:
-    """在消息列表中查找已有的摘要消息
-
-    Returns:
-        (summary_index, summary_text) 或 (-1, "")
+def _generate_summary(
+    content: str,
+    llm,
+    existing_summary: str = "",
+    metrics: Optional[dict] = None,
+) -> str:
     """
-    for i, msg in enumerate(messages):
-        if hasattr(msg, "type") and msg.type == "system":
-            content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
-            if SUMMARY_PREFIX in content:
-                # 提取摘要正文（去掉前缀标记）
-                body = content.split(SUMMARY_PREFIX, 1)[-1].strip()
-                return i, body
-    return -1, ""
-
-
-def _llm_summarize(old_msgs: list, existing_summary: str, llm) -> str:
-    """用 LLM 生成结构化摘要（增量更新模式）
+    生成摘要，带重试和容错。
 
     Args:
-        old_msgs: 需要摘要的旧消息列表
-        existing_summary: 已有的摘要文本（空字符串表示首次摘要）
+        content: 待摘要的消息文本
         llm: ChatOpenAI 实例
+        existing_summary: 已有摘要（增量更新模式）
+        metrics: 统计信息字典（可选）
 
     Returns:
         摘要文本
     """
-    history_text = _messages_to_text(old_msgs)
+    if metrics is None:
+        metrics = {}
 
-    # 截断超长历史
-    if len(history_text) > 12000:
-        history_text = history_text[:12000] + "\n...(对话历史已截断)"
+    for attempt in range(SUMMARY_MAX_RETRIES):
+        try:
+            metrics.setdefault("summarization_api_calls", 0)
+            metrics["summarization_api_calls"] += 1
 
-    if existing_summary:
-        # 增量更新模式
-        prompt_text = INCREMENTAL_TEMPLATE.format(
-            old_summary=existing_summary,
-            new_history=history_text,
-            max_chars=SUMMARY_MAX_CHARS,
-        )
-    else:
-        # 首次摘要模式
-        prompt_text = SUMMARY_TEMPLATE.format(history=history_text)
+            if existing_summary:
+                history_text = content
+                if len(history_text) > 12000:
+                    history_text = history_text[:12000] + "\n...(对话历史已截断)"
+                prompt_text = INCREMENTAL_TEMPLATE.format(
+                    old_summary=existing_summary,
+                    new_history=history_text,
+                    max_chars=SUMMARY_MAX_CHARS,
+                )
+            else:
+                prompt_text = SUMMARY_TEMPLATE.format(
+                    summary_target_tokens=SUMMARY_TARGET_TOKENS,
+                    content=content,
+                    summary_prefix=SUMMARY_PREFIX,
+                )
 
-    try:
-        response = llm.invoke([
-            SystemMessage(content="你是一个对话摘要助手。输出简洁的结构化摘要，使用中文。"),
-            HumanMessage(content=prompt_text),
-        ])
-        summary = response.content if isinstance(response.content, str) else str(response.content)
+            response = llm.invoke([
+                SystemMessage(content="你是一个对话摘要助手。输出简洁的结构化摘要，使用中文。"),
+                HumanMessage(content=prompt_text),
+            ])
+            summary = response.content if isinstance(response.content, str) else str(response.content)
 
-        # 截断过长的摘要
-        if len(summary) > SUMMARY_MAX_CHARS:
-            summary = summary[:SUMMARY_MAX_CHARS] + "\n...(摘要已截断)"
+            if len(summary) > SUMMARY_MAX_CHARS:
+                summary = summary[:SUMMARY_MAX_CHARS] + "\n...(摘要已截断)"
 
-        return summary
-    except Exception as e:
-        print(f"[COMPRESS] LLM 摘要失败: {str(e)[:200]}，回退到简单摘要", flush=True)
-        return _simple_summarize(old_msgs)
+            return summary
+
+        except Exception as e:
+            metrics.setdefault("summarization_errors", 0)
+            metrics["summarization_errors"] += 1
+            logger.warning(f"摘要生成尝试 {attempt + 1}/{SUMMARY_MAX_RETRIES} 失败: {e}")
+
+            if attempt < SUMMARY_MAX_RETRIES - 1:
+                time.sleep(_jittered_backoff(attempt + 1, base_delay=SUMMARY_BASE_DELAY))
+            else:
+                logger.warning("摘要生成全部失败，使用兜底文本")
+                return FALLBACK_SUMMARY
 
 
 # ═══════════════════════════════════════════════════════════
-# Phase 4: 简单摘要回退（无 LLM 时使用）
+# Phase 6: 简单摘要回退 (Dasheng原有，保留)
 # ═══════════════════════════════════════════════════════════
 
 def _simple_summarize(messages: list) -> str:
-    """简单摘要：只保留用户消息和 AI 回复的关键行（兜底方案）"""
+    """简单摘要：无LLM时的兜底方案"""
     lines = []
     for msg in messages:
         role = getattr(msg, "type", "unknown")
         content = getattr(msg, "content", "") or ""
         if role == "system" and SUMMARY_PREFIX in content:
-            # 保留旧摘要
             body = content.split(SUMMARY_PREFIX, 1)[-1].strip()
             lines.append(f"[旧摘要]: {body[:500]}")
         elif role == "human":
@@ -305,7 +417,7 @@ def _simple_summarize(messages: list) -> str:
         elif role == "ai" and content and not (hasattr(msg, "tool_calls") and msg.tool_calls):
             lines.append(f"AI答: {content[:100]}")
         elif role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
-            tool_names = ", ".join(tc["name"] for tc in msg.tool_calls)
+            tool_names = ", ".join(tc.get("name", "?") for tc in msg.tool_calls)
             lines.append(f"AI调用: {tool_names}")
     return "\n".join(lines[-30:])
 
@@ -314,74 +426,137 @@ def _simple_summarize(messages: list) -> str:
 # 主入口
 # ═══════════════════════════════════════════════════════════
 
-def compress_messages(messages: list, llm=None) -> list:
-    """压缩消息列表（对标 Hermes ContextCompressor，简化版）
+def compress_messages(messages: list, llm=None, metrics: Optional[dict] = None) -> list:
+    """
+    压缩消息列表（融合 Hermes + Dasheng 方案）。
 
     流程：
     1. 工具输出预处理（去重+截断）
-    2. 检查是否需要压缩（token 超阈值）
-    3. 基于 token 预算计算分割点
-    4. 对旧消息生成/更新结构化摘要
-    5. 返回 [摘要SystemMessage] + 尾部保留消息
+    2. 检查是否需要压缩
+    3. 找出受保护区域
+    4. 计算压缩区域边界（带边界保护）
+    5. 生成/更新摘要
+    6. 组装结果
+
+    Args:
+        messages: 消息列表
+        llm: ChatOpenAI 实例（可选，None时回退到简单摘要）
+        metrics: 统计信息字典（可选）
+
+    Returns:
+        压缩后的消息列表
     """
-    if len(messages) <= MIN_TAIL_MESSAGES:
+    if metrics is None:
+        metrics = {}
+
+    original_count = len(messages)
+    original_tokens = _count_trajectory_tokens(messages)
+    metrics["original_tokens"] = original_tokens
+    metrics["original_turns"] = original_count
+
+    if original_count <= MIN_TAIL_MESSAGES:
         return messages
 
     # Phase 1: 工具输出预处理
     messages = _prune_tool_outputs(messages)
 
-    # 检查是否需要压缩（双重条件：token 超阈值 OR 消息条数过多）
-    total_tokens = 0
-    for msg in messages:
-        content = ""
-        if hasattr(msg, "content") and msg.content:
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            content += _json.dumps(msg.tool_calls, ensure_ascii=False, default=str)
-        total_tokens += estimate_tokens(content) + 10
+    original_tokens = _count_trajectory_tokens(messages)
+    metrics["original_tokens"] = original_tokens
+    metrics["pruned_tool_calls"] = original_count - len(messages)
 
+    total_tokens = original_tokens
     threshold = get_compress_threshold()
     need_compress = total_tokens >= threshold or len(messages) >= 40
     if not need_compress:
         return messages
 
-    # Phase 2: 计算分割点
-    max_tokens = get_max_context_tokens()
-    tail_budget = int(max_tokens * TAIL_TOKEN_RATIO)
-    split = _find_tail_boundary(messages, tail_budget)
+    # Phase 2: 找出受保护区域
+    protected, compress_start, compress_end = _find_protected_indices(messages)
 
-    if split == 0:
-        # 全部消息都在预算内，无需压缩
+    # Phase 3: 边界保护
+    compress_start = _snap_boundary(messages, compress_start, 0, compress_end)
+
+    if compress_start >= compress_end:
         return messages
 
-    old_msgs = messages[:split]
-    tail_msgs = messages[split:]
+    # Phase 4: 计算压缩区域
+    max_tokens = get_max_context_tokens()
+    tail_budget = int(max_tokens * TAIL_TOKEN_RATIO)
 
-    # Phase 3: 查找已有摘要 + 生成新摘要
-    existing_idx, existing_summary = _find_existing_summary(old_msgs)
+    old_tokens = _count_trajectory_tokens(messages[:compress_start])
+    tokens_to_compress = old_tokens - tail_budget
+    if tokens_to_compress <= 0:
+        return messages
 
-    # 从旧消息中移除旧的摘要消息（避免重复）
+    accumulated = 0
+    split = compress_start
+    for i in range(compress_start, compress_end):
+        accumulated += _msg_tokens(messages[i])
+        split = i + 1
+        if accumulated >= tokens_to_compress:
+            break
+
+    if accumulated < tokens_to_compress:
+        split = compress_end
+
+    split = _snap_boundary(messages, split, compress_start, compress_end)
+    if split <= compress_start:
+        return messages
+
+    content_to_summarize = _extract_turn_content_for_summary(messages, compress_start, split)
+
+    # Phase 5: 查找已有摘要 + 生成
+    existing_idx, existing_summary = _find_existing_summary(messages[:compress_start])
+
     if existing_idx >= 0:
-        old_msgs_for_summary = old_msgs[:existing_idx] + old_msgs[existing_idx + 1:]
+        old_for_summary = messages[compress_start:existing_idx] + messages[existing_idx + 1:split]
     else:
-        old_msgs_for_summary = old_msgs
+        old_for_summary = messages[compress_start:split]
 
     if llm is not None:
-        summary_text = _llm_summarize(old_msgs_for_summary, existing_summary, llm)
+        summary_text = _generate_summary(
+            _messages_to_text(old_for_summary) if not existing_summary else content_to_summarize,
+            llm,
+            existing_summary=existing_summary,
+            metrics=metrics,
+        )
     else:
-        # 没有 LLM 时合并已有摘要 + 简单摘要
-        simple = _simple_summarize(old_msgs_for_summary)
+        simple = _simple_summarize(old_for_summary)
         if existing_summary:
             summary_text = f"{existing_summary}\n\n--- 新增 ---\n{simple}"
         else:
             summary_text = simple
 
-    # Phase 4: 组装结果
-    summary_msg = SystemMessage(content=f"{SUMMARY_PREFIX}\n{summary_text}")
-    result = [summary_msg] + tail_msgs
+    # Phase 6: 组装结果
+    summary_msg = SystemMessage(content=f"{SUMMARY_PREFIX}: {summary_text}")
+    result = [summary_msg] + messages[split:]
 
-    print(f"[COMPRESS] {len(messages)} msgs → 1 summary + {len(tail_msgs)} tail "
-          f"(saved {len(old_msgs)} msgs, {total_tokens}→~{estimate_tokens(summary_text)} tokens in summary)",
-          flush=True)
+    compressed_tokens = _count_trajectory_tokens(result)
+    metrics["compressed_tokens"] = compressed_tokens
+    metrics["compressed_turns"] = len(result)
+    metrics["tokens_saved"] = original_tokens - compressed_tokens
+    metrics["compression_ratio"] = compressed_tokens / max(original_tokens, 1)
+    metrics["turns_removed"] = len(result) - len(messages)
+
+    logger.info(
+        f"[COMPRESS] {original_count} msgs → {len(result)} msgs "
+        f"({original_tokens}→{compressed_tokens} tokens, "
+        f"ratio={metrics['compression_ratio']:.2%})"
+    )
 
     return result
+
+
+def compress_with_fallback(messages: list, llm=None) -> list:
+    """
+    带 fallback 的压缩入口。
+    """
+    if llm is None:
+        return compress_messages(messages, llm=None)
+
+    try:
+        return compress_messages(messages, llm=llm)
+    except Exception as e:
+        logger.error(f"压缩过程中出错: {e}，尝试简单摘要", exc_info=True)
+        return compress_messages(messages, llm=None)
+
