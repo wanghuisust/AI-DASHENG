@@ -299,7 +299,8 @@ def _summarize_without_tools(messages: list) -> str:
     
     # 追加总结请求
     summary_messages.append(HumanMessage(
-        content="你已经执行了多步操作但达到了迭代上限或被循环检测终止。请总结你已经完成的工作和发现，直接回复用户，不要再调用任何工具。"
+        content="你之前的操作步骤较多，现在需要收尾。请总结你已经完成的工作和发现，直接回复用户。"
+        "注意：不要说'迭代上限'、'操作受限'之类的技术词汇，而是自然地总结已完成的进展和尚未完成的部分。不要再调用任何工具。"
     ))
     
     # 截断到合理长度
@@ -599,9 +600,8 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                 messages.append(HumanMessage(content=user_msg))
 
                 # ── 预压缩：在 graph.invoke 之前压缩历史消息 ──
-                # 原因：graph 的 recursion_limit 是 80，如果历史消息里有大量工具调用对，
-                # LLM 看到旧意图会继续重复执行，80次迭代全用在重复操作上。
-                # 在 API 层先压缩，确保传入 graph 的消息是精简的。
+                # 原因：graph 的 recursion_limit 是 150，如果历史消息里有大量工具调用对，
+                # LLM 看到旧意图会继续重复执行。在 API 层先压缩，确保传入 graph 的消息是精简的。
                 if len(messages) >= 20:
                     from context_compress import compress_messages
                     from graph import _get_compress_llm, create_llm
@@ -625,7 +625,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     try:
                         invoke_result[0] = _sync_graph.invoke(
                             {"messages": messages},
-                            config={"recursion_limit": 80},
+                            config={"recursion_limit": 150},
                         )
                     except Exception as e:
                         # GraphRecursionError: 达到 recursion_limit
@@ -733,12 +733,9 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
         _ka_thread.start()
 
         try:
-            # 注册 cancel_event，以便外部取消此请求
+            # 注册 cancel_event，以便外部取消此请求（/cancel 命令仍可用）
             _local_cancel = threading.Event()
             with _cancel_lock:
-                old_evt = _cancel_events.get(thread_id)
-                if old_evt:
-                    old_evt.set()  # 取消旧请求
                 _cancel_events[thread_id] = _local_cancel
 
             if not acquire_thread_lock(thread_id, timeout=1800):
@@ -775,6 +772,40 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                     _llm_for_graph = create_llm(model=_thread_model)
                 _cancelable_graph = build_graph(llm=_llm_for_graph, cancel_event=_local_cancel)
 
+                # ── 重置工具调用守卫 + 设置工具执行进度回调 ──
+                from graph import _set_tool_progress_callback, _reset_tool_guardrail
+                _reset_tool_guardrail()  # 新 turn 开始，清零 guardrail 状态
+                def _tool_progress_cb(event_type, data):
+                    """工具节点进度回调：通过SSE推送工具执行状态"""
+                    try:
+                        if event_type == "tool_started":
+                            sse_send("tool_started", {
+                                "tool": data.get("tool", ""),
+                                "args": data.get("args", {}),
+                                "message": f"正在执行 {data.get('tool', '')}...",
+                            })
+                        elif event_type == "tool_done":
+                            sse_send("tool_done", {
+                                "tool": data.get("tool", ""),
+                                "message": f"{data.get('tool', '')} 执行完成",
+                                "content": data.get("content", "")[:200],
+                            })
+                        elif event_type == "tool_timeout":
+                            sse_send("tool_timeout", {
+                                "tool": data.get("tool", ""),
+                                "timeout": data.get("timeout", 20),
+                                "message": f"⏱ {data.get('tool', '')} 执行超时({data.get('timeout', 20)}s)，正在换用其他方式...",
+                            })
+                        elif event_type == "tool_error":
+                            sse_send("tool_error", {
+                                "tool": data.get("tool", ""),
+                                "error": data.get("error", "")[:200],
+                                "message": f"❌ {data.get('tool', '')} 执行报错，正在换用其他方式...",
+                            })
+                    except Exception:
+                        pass  # 回调不应影响主流程
+                _set_tool_progress_callback(_tool_progress_cb)
+
                 # ── 用队列桥接 async astream_events → 同步 SSE 发送 ──
                 import queue as _queue_mod
                 _event_queue = _queue_mod.Queue(maxsize=256)
@@ -796,7 +827,7 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                             async for event in _cancelable_graph.astream_events(
                                 {"messages": messages},
                                 version="v2",
-                                config={"recursion_limit": 80},
+                                config={"recursion_limit": 150},
                             ):
                                 if _local_cancel.is_set() or _stream_done[0]:
                                     break
@@ -913,7 +944,8 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
                                     "content": _current_llm_text[0].strip(),
                                 })
 
-                        # 重置本轮 LLM 追踪
+                        # 重置本轮 LLM 追踪 + 通知 gateway 重置 streaming 位置
+                        sse_send("text_reset", {})
                         _current_llm_text[0] = ""
                         _current_tool_calls[0] = None
 
@@ -986,6 +1018,13 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
             # 清理 cancel_event
             with _cancel_lock:
                 _cancel_events.pop(thread_id, None)
+            # 清理工具进度回调 + guardrail
+            try:
+                from graph import _set_tool_progress_callback, _reset_tool_guardrail
+                _set_tool_progress_callback(None)
+                _reset_tool_guardrail()
+            except Exception:
+                pass
 
     # ── 创建会话 ─────────────────────────────────────────
 

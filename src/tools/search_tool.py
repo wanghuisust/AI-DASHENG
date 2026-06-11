@@ -1,4 +1,4 @@
-"""文件搜索工具 — ripgrep 加速版
+"""文件搜索工具 — ripgrep 加速版 (DashengTool 版)
 
 优先使用 rg（ripgrep）搜索，回退到 grep，最终回退到纯 Python os.walk。
 支持分页（offset/limit）、多种输出模式、上下文行。
@@ -11,7 +11,8 @@ import shutil
 import subprocess
 from typing import Optional
 
-from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from tools.tool_base import build_tool, ValidationResult, DEFAULT_MAX_RESULT_SIZE_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +47,10 @@ def _run_cmd(cmd: list[str], timeout: int = 30) -> tuple[int, str, str]:
 
 def _parse_match_line(line: str) -> Optional[tuple[str, int, str]]:
     """解析 rg/grep 输出的 match 行: 'path:lineno:content'
-    
+
     兼容 Windows 盘符路径（如 C:\\path）。
     返回 (path, line_number, content) 或 None。
     """
-    # Windows 盘符: C:\path:10:content → 第一个 : 是盘符
     _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
     m = _match_re.match(line)
     if m:
@@ -96,7 +96,6 @@ def _format_results(
             return "未找到匹配的内容"
         lines = []
         for path, lineno, content in matches:
-            # 截断过长的行
             display = content.strip()[:200]
             lines.append(f"{path}:{lineno}: {display}")
         if truncated:
@@ -108,20 +107,17 @@ def _format_results(
 
 def _search_files_rg(pattern: str, directory: str, limit: int, offset: int) -> dict:
     """用 rg --files 按文件名搜索（快速，尊重 .gitignore）"""
-    # 自动补全通配符：裸名 → *name*
     if '/' not in pattern and not pattern.startswith('*'):
         glob_pattern = f"*{pattern}*"
     else:
         glob_pattern = pattern
 
-    fetch_limit = limit + offset + 50  # 多取一些以报告总数
+    fetch_limit = limit + offset + 50
 
-    # 先尝试按修改时间排序（rg 13+）
     cmd = ["rg", "--files", "--sortr=modified", "-g", glob_pattern, directory]
     exit_code, stdout, stderr = _run_cmd(cmd, timeout=30)
 
     if exit_code == 2 or not stdout.strip():
-        # --sortr 不支持或出错，回退无排序
         cmd = ["rg", "--files", "-g", glob_pattern, directory]
         exit_code, stdout, stderr = _run_cmd(cmd, timeout=30)
 
@@ -142,7 +138,6 @@ def _search_files_glob(pattern: str, directory: str, limit: int, offset: int) ->
     search_path = os.path.join(directory, "**", pattern)
     matches = glob_mod.glob(search_path, recursive=True)
 
-    # 按修改时间排序（最近的在前）
     matches.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
 
     total = len(matches)
@@ -175,7 +170,6 @@ def _search_content_rg(
     elif output_mode == "count":
         cmd.append("-c")
 
-    # 多取一些以报告总数
     fetch_limit = limit + offset + (200 if context > 0 else 0)
     cmd.extend(["-m", str(fetch_limit)])
 
@@ -183,7 +177,6 @@ def _search_content_rg(
 
     exit_code, stdout, stderr = _run_cmd(cmd, timeout=30)
 
-    # rg exit codes: 0=matches, 1=no matches, 2=error
     if exit_code == 2 and not stdout.strip():
         return {"matches": [], "files": [], "counts": {}, "total_count": 0,
                 "error": f"rg error: {stderr.strip()}"}
@@ -363,8 +356,18 @@ def _search_content_python(
 
 # ── 主入口 ──────────────────────────────────────────────
 
-@tool
-def search_files(
+class SearchFilesInput(BaseModel):
+    pattern: str = Field(description="搜索模式。target='files'时为文件名匹配(支持*通配符)，target='content'时为正则表达式")
+    directory: str = Field(default=".", description="搜索目录，默认当前目录")
+    target: str = Field(default="files", description="搜索类型: files=按文件名, content=按文件内容")
+    file_glob: Optional[str] = Field(default=None, description="限定文件类型(如*.py,*.log)")
+    limit: int = Field(default=50, description="返回结果数量上限")
+    offset: int = Field(default=0, description="跳过前N条结果，用于分页")
+    output_mode: str = Field(default="content", description="内容搜索输出: content/files_only/count")
+    context: int = Field(default=0, description="显示匹配行上下各N行(仅rg/grep)")
+
+
+def _search_files_impl(
     pattern: str,
     directory: str = ".",
     target: str = "files",
@@ -374,24 +377,7 @@ def search_files(
     output_mode: str = "content",
     context: int = 0,
 ) -> str:
-    """搜索文件或文件内容。优先使用 ripgrep 加速，自动回退。
-
-    Args:
-        pattern: 搜索模式。
-            - target="files" 时：文件名匹配模式（支持 * 通配符，如 *.py, *config*）
-            - target="content" 时：文件内容搜索（正则表达式，如 "train_run", "loss=\\d+\\.\\d+"）
-        directory: 搜索目录，默认当前目录
-        target: 搜索类型，"files" 按文件名搜索，"content" 按文件内容搜索（默认 "files"）
-        file_glob: 限定文件类型（如 "*.py", "*.log"），不指定则搜索所有文本文件
-        limit: 返回结果数量上限（默认 50）
-        offset: 跳过前 N 条结果（默认 0），用于分页
-        output_mode: 内容搜索输出格式 — "content" 显示匹配行（默认），"files_only" 仅列文件，"count" 统计每文件匹配数
-        context: 显示匹配行上下各 N 行上下文（默认 0，仅 rg/grep 模式生效）
-
-    Returns:
-        匹配的文件列表或内容匹配结果
-    """
-    # 校正分页参数
+    """核心逻辑 — 搜索文件或文件内容"""
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
@@ -460,3 +446,25 @@ def _do_search_content(
 
     logger.info(f"[search_files] content mode: engine={engine}, pattern={pattern}, total={total}")
     return output
+
+
+search_files = build_tool(
+    name="search_files",
+    description=(
+        "搜索文件或文件内容。优先使用 ripgrep 加速，自动回退。\n"
+        "Args:\n"
+        "  pattern: 搜索模式(target='files'时为文件名匹配，target='content'时为正则)\n"
+        "  directory: 搜索目录，默认当前目录\n"
+        "  target: 'files'按文件名 / 'content'按内容(默认files)\n"
+        "  file_glob: 限定文件类型(如*.py)\n"
+        "  limit: 结果数量上限(默认50)\n"
+        "  offset: 跳过前N条(默认0)\n"
+        "  output_mode: content/files_only/count(默认content)\n"
+        "  context: 上下文行数(默认0，仅rg/grep)"
+    ),
+    func=_search_files_impl,
+    args_schema=SearchFilesInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=True,
+    is_concurrency_safe=True,   # 搜索无副作用，可并行
+)

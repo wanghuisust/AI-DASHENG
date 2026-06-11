@@ -1,54 +1,60 @@
-"""Skill 管理工具 — 安装/列出/搜索技能"""
+"""Skill 管理工具 — 安装/列出/搜索技能 (DashengTool 版)"""
 
-from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from tools.tool_base import build_tool, DEFAULT_MAX_RESULT_SIZE_CHARS
 
 
-@tool
-def skill_install(source: str, name: str = "") -> str:
-    """安装技能。支持从 ClawHub 或 GitHub 安装。
+# ── 参数 Schema ──
 
-    Args:
-        source: 安装来源。
-            - ClawHub 技能名（如 "github-code-review"）：自动从 ClawHub 下载
-            - GitHub URL（如 "https://github.com/user/repo"）：从 GitHub 仓库下载
-            - GitHub 短格式（如 "user/repo"）：从 GitHub 仓库下载
-            - GitHub 子目录（如 "https://github.com/user/repo/tree/main/skills/github-auth"）：下载子目录
-        name: 可选，自定义技能名（留空则从 SKILL.md 自动读取）
+class SkillInstallInput(BaseModel):
+    source: str = Field(description="安装来源: ClawHub技能名 / GitHub URL / owner/repo")
+    name: str = Field(default="", description="可选，自定义技能名")
 
-    重要提示：
-        - 如果 ClawHub 不可达，会自动走代理重试
-        - 如果 ClawHub 上找不到，请尝试用 GitHub URL 安装
-        - 安装后技能会自动注入到 system prompt，下次对话生效
 
-    Returns:
-        安装结果信息
-    """
-    from skills import SkillManager
-    import os
+class SkillListInput(BaseModel):
+    pass
 
-    # 获取全局 skill_manager 实例
+
+class SkillSearchInput(BaseModel):
+    query: str = Field(description="搜索关键词")
+    limit: int = Field(default=10, description="返回结果数量上限")
+
+
+class SkillViewInput(BaseModel):
+    name: str = Field(description="技能名称")
+
+
+class SkillRemoveInput(BaseModel):
+    name: str = Field(description="技能名称")
+
+
+# ── 辅助 ──
+
+def _get_skill_manager():
+    """获取全局 SkillManager 实例"""
+    try:
+        from graph import _skill_manager
+        return _skill_manager
+    except ImportError:
+        return None
+
+
+# ── 实现 ──
+
+def _skill_install_impl(source: str, name: str = "") -> str:
     _sm = _get_skill_manager()
     if not _sm:
         return "[错误] SkillManager 未初始化"
 
-    # 判断来源类型
     if source.startswith("http") or "/" in source.split()[0]:
-        # GitHub URL 或 owner/repo 格式
         result = _sm.install_from_github(source)
     else:
-        # ClawHub 技能名
         result = _sm.install_from_clawhub(source)
 
     return result.get("message", str(result))
 
 
-@tool
-def skill_list() -> str:
-    """列出所有已安装的技能。
-
-    Returns:
-        已安装技能列表
-    """
+def _skill_list_impl() -> str:
     _sm = _get_skill_manager()
     if not _sm:
         return "[错误] SkillManager 未初始化"
@@ -68,17 +74,7 @@ def skill_list() -> str:
     return "\n".join(lines)
 
 
-@tool
-def skill_search(query: str, limit: int = 10) -> str:
-    """搜索 ClawHub 技能库。如果 ClawHub 不可达，会返回空结果，请改用 GitHub 搜索。
-
-    Args:
-        query: 搜索关键词（如 "github", "deploy", "debug"）
-        limit: 返回结果数量上限（默认 10）
-
-    Returns:
-        搜索结果列表。如果为空，建议用 skill_install(source="GitHub URL") 直接安装
-    """
+def _skill_search_impl(query: str, limit: int = 10) -> str:
     _sm = _get_skill_manager()
     if not _sm:
         return "[错误] SkillManager 未初始化"
@@ -92,27 +88,17 @@ def skill_search(query: str, limit: int = 10) -> str:
         name = r.get("name", "?")
         desc = r.get("description", "")
         lines.append(f"  • {name} — {desc}")
-    lines.append(f"\n使用 skill_install(source=\"技能名\") 安装")
+    lines.append("\n使用 skill_install(source=\"技能名\") 安装")
     return "\n".join(lines)
 
 
-@tool
-def skill_view(name: str) -> str:
-    """加载并查看技能的详细内容。当 system prompt 中的技能索引有匹配时，必须先用此工具加载技能详情。
-
-    Args:
-        name: 技能名称（如 "github-repo-management"、"systematic-debugging"）
-
-    Returns:
-        技能的完整内容（含步骤、命令、陷阱等），用于指导执行
-    """
+def _skill_view_impl(name: str) -> str:
     _sm = _get_skill_manager()
     if not _sm:
         return "[错误] SkillManager 未初始化"
 
     skill = _sm.get(name)
     if not skill:
-        # 模糊匹配：名称部分包含
         candidates = [s for s in _sm.skills if name.lower() in s.lower()]
         if len(candidates) == 1:
             skill = _sm.skills[candidates[0]]
@@ -124,16 +110,7 @@ def skill_view(name: str) -> str:
     return skill.to_prompt()
 
 
-@tool
-def skill_remove(name: str) -> str:
-    """删除已安装的技能。
-
-    Args:
-        name: 技能名称
-
-    Returns:
-        删除结果
-    """
+def _skill_remove_impl(name: str) -> str:
     _sm = _get_skill_manager()
     if not _sm:
         return "[错误] SkillManager 未初始化"
@@ -143,10 +120,59 @@ def skill_remove(name: str) -> str:
     return f"❌ 技能 '{name}' 不存在"
 
 
-def _get_skill_manager():
-    """获取全局 SkillManager 实例（从 graph.py 模块级变量）"""
-    try:
-        from graph import _skill_manager
-        return _skill_manager
-    except ImportError:
-        return None
+# ── 注册 ──
+
+skill_install = build_tool(
+    name="skill_install",
+    description=(
+        "安装技能。支持从 ClawHub 或 GitHub 安装。\n"
+        "Args:\n"
+        "  source: 安装来源(ClawHub技能名/GitHub URL/owner/repo)\n"
+        "  name: 可选，自定义技能名"
+    ),
+    func=_skill_install_impl,
+    args_schema=SkillInstallInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=False,
+    is_concurrency_safe=False,
+)
+
+skill_list = build_tool(
+    name="skill_list",
+    description="列出所有已安装的技能。",
+    func=_skill_list_impl,
+    args_schema=SkillListInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=True,
+    is_concurrency_safe=True,
+)
+
+skill_search = build_tool(
+    name="skill_search",
+    description="搜索 ClawHub 技能库。",
+    func=_skill_search_impl,
+    args_schema=SkillSearchInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=True,
+    is_concurrency_safe=True,
+)
+
+skill_view = build_tool(
+    name="skill_view",
+    description="加载并查看技能的详细内容。当 system prompt 中的技能索引有匹配时，必须先用此工具加载技能详情。",
+    func=_skill_view_impl,
+    args_schema=SkillViewInput,
+    max_result_size=float("inf"),  # 技能内容可能很长，不持久化
+    is_read_only=True,
+    is_concurrency_safe=True,
+)
+
+skill_remove = build_tool(
+    name="skill_remove",
+    description="删除已安装的技能。",
+    func=_skill_remove_impl,
+    args_schema=SkillRemoveInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=False,
+    is_concurrency_safe=False,
+)

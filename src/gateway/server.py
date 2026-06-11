@@ -115,9 +115,8 @@ def _call_agent_sync(message: PlatformMessage) -> str:
         return f"抱歉，处理消息时出错"
 
 
-def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock, cancel_event: threading.Event = None, on_status=None) -> str:
+def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lock: threading.Lock, on_status=None) -> str:
     """调用 Agent 流式接口（SSE），实时更新 current_status
-    cancel_event: 如果被 set，中止 SSE 读取
     on_status: 回调函数 on_status(step, data)，收到 status 事件时调用，用于实时推送进度
     """
     import httpx
@@ -130,21 +129,10 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
     try:
         with httpx.Client(timeout=httpx.Timeout(1800.0, connect=10.0)) as client:
             with client.stream("POST", url, json=payload) as resp:
-                # 记录 resp 到 active_requests，以便取消时关闭
-                with _active_requests_lock:
-                    entry = _active_requests.get(message.chat_id)
-                    if entry:
-                        entry["sse_resp"] = resp
-
                 response_text = ""
                 logger.debug(f"[SSE] Connected to {url}, reading events...")
                 event_type = ""
                 for line_bytes in resp.iter_lines():
-                    # 检查是否被取消
-                    if cancel_event and cancel_event.is_set():
-                        logger.info(f"[SSE] 请求被取消，停止读取 (chat_id={message.chat_id})")
-                        return ""
-
                     line = line_bytes.decode("utf-8", errors="replace").strip() if isinstance(line_bytes, bytes) else line_bytes.strip()
                     if not line:
                         continue
@@ -236,6 +224,29 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                                     on_status("tool_done", data)
                                 except Exception as e:
                                     logger.warning(f"[on_status] tool_done 回调异常: {e}")
+                        elif event_type == "tool_timeout":
+                            # 工具执行超时，提示用户正在换方式
+                            _tname = data.get("tool", "")
+                            _tsec = data.get("timeout", 20)
+                            with status_lock:
+                                current_status["message"] = f"⏱ {_tname} 超时({_tsec}s)，换用其他方式…"
+                                current_status["step"] = "tool_timeout"
+                            if on_status:
+                                try:
+                                    on_status("tool_timeout", data)
+                                except Exception as e:
+                                    logger.warning(f"[on_status] tool_timeout 回调异常: {e}")
+                        elif event_type == "tool_error":
+                            # 工具执行报错，提示用户正在换方式
+                            _tname = data.get("tool", "")
+                            with status_lock:
+                                current_status["message"] = f"❌ {_tname} 报错，换用其他方式…"
+                                current_status["step"] = "tool_error"
+                            if on_status:
+                                try:
+                                    on_status("tool_error", data)
+                                except Exception as e:
+                                    logger.warning(f"[on_status] tool_error 回调异常: {e}")
                         elif event_type == "result":
                             response_text = data.get("response", "")
                             # 收到最终回复，清掉 thinking 类的 pending steps
@@ -246,6 +257,14 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
                                     pass
                             # result 是最终回复，收到后立即跳出
                             break
+                        elif event_type == "text_reset":
+                            # LLM 一轮结束，_current_llm_text 重置为空，gateway 也要重置 streaming 位置
+                            # 否则下一轮 text_delta 的 text 从 0 开始，但 streaming_sent 保留旧值导致位置错位
+                            if on_status:
+                                try:
+                                    on_status("text_reset", {})
+                                except Exception:
+                                    pass
                         elif event_type == "done":
                             # 服务端显式结束标记
                             break
@@ -274,48 +293,52 @@ def _call_agent_stream(message: PlatformMessage, current_status: dict, status_lo
 # ── 消息处理 ─────────────────────────────────────────────────────────────────
 # ── 消息处理 ─────────────────────────────────────────────────────────────────
 
-# 按 chat_id 跟踪正在处理的请求，用于取消旧请求
-_active_requests = {}        # chat_id → {"thread": Thread, "cancel_event": Event, "sse_resp": ...}
+# 按 chat_id 跟踪正在处理的请求
+_active_requests = {}        # chat_id → {"thread": Thread, "start_time": float}
 _active_requests_lock = threading.Lock()
 
+# 排队消息：chat_id → [PlatformMessage, ...]  (新消息来时旧任务还在跑则排队)
+_pending_messages = {}       # chat_id → list[PlatformMessage]
+_pending_messages_lock = threading.Lock()
 
-def _cancel_active_request(chat_id: str, platform: str = "", is_group: bool = False, user_id: str = "") -> bool:
-    """取消同一 chat_id 的正在处理的请求，返回是否有请求被取消"""
+# busy-ack 防抖：避免频繁发"排队中"提示
+_busy_ack_ts = {}            # chat_id → float (上次发送时间)
+_BUSY_ACK_COOLDOWN = 30.0    # 30秒内同一 chat_id 只发一次 ack
+
+
+def _send_busy_ack(message: PlatformMessage):
+    """向用户发送'正在处理中，新消息已排队'提示（参考Hermes queue模式）
+    30秒内同一chat_id只发一次，避免刷屏
+    """
+    now = time.time()
+    last_ack = _busy_ack_ts.get(message.chat_id, 0)
+    if now - last_ack < _BUSY_ACK_COOLDOWN:
+        return  # 最近发过，跳过
+
+    _busy_ack_ts[message.chat_id] = now
+    target = _wechat if message.platform == "wechat" else (qq_adapter if message.platform == "qq" else None)
+    if not target:
+        return
+
+    # 计算当前任务已运行时间
     with _active_requests_lock:
-        entry = _active_requests.get(chat_id)
-        if not entry:
-            return False
-        logger.info(f"[{chat_id}] 取消前一个正在处理的请求")
-        entry["cancel_event"].set()  # 通知 SSE 读取线程停止
-        # 关闭 SSE 连接
-        if entry.get("sse_resp"):
-            try:
-                entry["sse_resp"].close()
-            except Exception:
-                pass
-        # 通知 Agent API 取消
-        try:
-            cancel_url = f"{DASHENG_API}/v1/chat/cancel"
-            payload = json.dumps({"thread_id": chat_id}).encode("utf-8")
-            req = urllib.request.Request(cancel_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass  # Agent API 取消失败不阻塞
+        entry = _active_requests.get(message.chat_id)
+        start_time = entry.get("start_time", 0) if entry else 0
+    elapsed_min = int((now - start_time) / 60) if start_time else 0
+    status_detail = f"（已运行{elapsed_min}分钟）" if elapsed_min > 0 else ""
 
-        # 给客户端发"正在取消任务…"通知
-        if platform == "qq":
-            cancel_reply = PlatformReply(
-                platform=platform,
-                chat_id=chat_id,
-                text="⏳ 正在取消任务…",
-                is_group=is_group,
-                at_user=user_id,
-            )
-            try:
-                qq_adapter.send_reply(cancel_reply)
-            except Exception:
-                pass
-        return True
+    ack_text = f"⏳ 正在处理中{status_detail}，你的消息已排队，完成后自动处理。"
+    try:
+        ack_reply = PlatformReply(
+            platform=message.platform,
+            chat_id=message.chat_id,
+            text=ack_text,
+            is_group=message.is_group,
+            at_user=message.user_id,
+        )
+        target.send_reply(ack_reply)
+    except Exception as e:
+        logger.warning(f"[busy-ack] 发送失败: {e}")
 
 
 def _handle_slash_command(message: PlatformMessage, text: str):
@@ -498,15 +521,8 @@ def _handle_slash_command(message: PlatformMessage, text: str):
 
         else:
             # 未知命令，不拦截——当普通消息处理
-            # 取消同一 chat_id 的前一个请求
-            had_active = _cancel_active_request(
-                message.chat_id, message.platform, message.is_group, message.user_id
-            )
-            cancel_event = threading.Event()
-            t = threading.Thread(target=_process_and_reply, args=(message, cancel_event), daemon=True)
-            with _active_requests_lock:
-                _active_requests[message.chat_id] = {"thread": t, "cancel_event": cancel_event}
-            t.start()
+            handle_message(message)
+            return
 
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace") if e.fp else ""
@@ -523,7 +539,7 @@ def _handle_slash_command(message: PlatformMessage, text: str):
 
 
 def handle_message(message: PlatformMessage):
-    """统一消息处理入口 — 斜杠命令在此拦截，普通消息异步处理"""
+    """统一消息处理入口 — 斜杠命令在此拦截，普通消息排队处理（参考Hermes queue模式）"""
     logger.info(f"[{message.platform}] {message.user_id}@{message.chat_id}: {message.text[:80]}")
 
     # ── 斜杠命令拦截 ──
@@ -532,22 +548,34 @@ def handle_message(message: PlatformMessage):
         _handle_slash_command(message, text)
         return
 
-    # 取消同一 chat_id 的前一个请求
-    had_active = _cancel_active_request(
-        message.chat_id, message.platform, message.is_group, message.user_id
-    )
-
-    # 在新线程中处理，避免阻塞 QQ 心跳/事件循环
-    cancel_event = threading.Event()
-    t = threading.Thread(target=_process_and_reply, args=(message, cancel_event), daemon=True)
+    # 检查是否有正在处理的请求（同 chat_id）
     with _active_requests_lock:
-        _active_requests[message.chat_id] = {"thread": t, "cancel_event": cancel_event}
+        has_active = message.chat_id in _active_requests
+
+    if has_active:
+        # 旧任务还在跑 → 排队（参考Hermes queue模式）
+        logger.info(f"[{message.chat_id}] 旧任务仍在运行，新消息排队")
+        with _pending_messages_lock:
+            _pending_messages.setdefault(message.chat_id, []).append(message)
+        # 发送 busy-ack 提示
+        _send_busy_ack(message)
+        return
+
+    # 没有旧任务 → 直接处理
+    _start_processing(message)
+
+
+def _start_processing(message: PlatformMessage):
+    """启动新线程处理消息，注册到 _active_requests"""
+    t = threading.Thread(target=_process_and_reply, args=(message,), daemon=True)
+    with _active_requests_lock:
+        _active_requests[message.chat_id] = {"thread": t, "start_time": time.time()}
     t.start()
 
 
-def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
-    """实际处理：调用 Agent 流式接口，每60s推送当前步骤状态到 QQ
-    cancel_event: 如果被 set，表示有新请求到来，应取消当前请求
+def _process_and_reply(message: PlatformMessage):
+    """实际处理：调用 Agent 流式接口，推送进度，发送最终回复
+    完成后自动检查是否有排队消息需要处理（参考Hermes queue模式）
     """
     chat_id = message.chat_id
     try:
@@ -560,8 +588,6 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             """周期性发送 typing 指示（iLink typing 有时效，需每4秒续一次）"""
             count = 0
             while not progress_stop.wait(4):
-                if cancel_event.is_set():
-                    return
                 count += 1
                 try:
                     _wechat.send_typing(message.user_id, message.raw.get("context_token", ""))
@@ -580,8 +606,6 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             wechat_typing_thread = threading.Thread(target=_wechat_typing_loop, daemon=True)
             wechat_typing_thread.start()
 
-        # ── 发送开始处理通知（如果取消了前一个，_cancel_active_request 已发过通知） ──
-
         # ── 实时进度推送回调（微信/QQ 通用） ──
         _target = _wechat if message.platform == "wechat" else (qq_adapter if message.platform == "qq" else None)
         _progress_history = []           # 已推送的进度列表
@@ -593,8 +617,8 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         # ── 微信增量推送状态 ──
         _streaming_text_sent = [0]       # 已推送的文本字符数
         _streaming_last_push = [0.0]     # 上次推送时间戳
-        STREAMING_PUSH_MIN_CHARS = 150   # 最少累积 150 字才推
-        STREAMING_PUSH_MIN_INTERVAL = 4.0  # 两次推送最少间隔 4 秒
+        STREAMING_PUSH_MIN_CHARS = 300   # 最少累积 300 字才推（增大单次推送量，减少碎片消息）
+        STREAMING_PUSH_MIN_INTERVAL = 3.0  # 两次推送最少间隔 3 秒
 
         # ── 工具自然语言描述映射（Hermes 风格：半思考半行动）──
         _TOOL_ACTION = {
@@ -695,6 +719,13 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                         result_lines = [l for l in result.split("\n") if l.strip()]
                         err_line = result_lines[0][:30] if result_lines else "执行出错"
                         lines.append(f"⚠️ {err_line}")
+                elif m["type"] == "tool_timeout":
+                    tool = m.get("tool", "")
+                    tsec = m.get("timeout", 20)
+                    lines.append(f"⏱ {tool} 超时({tsec}s)，换用其他方式…")
+                elif m["type"] == "tool_error":
+                    tool = m.get("tool", "")
+                    lines.append(f"❌ {tool} 报错，换用其他方式…")
                 elif m["type"] == "thinking":
                     lines.append(f"💭 {m.get('text', '')[:80]}")
 
@@ -721,8 +752,6 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             """SSE status 回调：攒步骤，定时合并推送给客户端（微信/QQ）"""
             if not _target:
                 return
-            if cancel_event.is_set():
-                return
 
             now = time.time()
             tool = data.get("tool", "")
@@ -731,14 +760,29 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
             # ── 收到最终回复，清掉 thinking 避免和 result 重复 ──
             if step == "final_result":
                 # 只保留 tool 类步骤，清掉 thinking（因为 result 会包含完整回复）
-                _pending_steps[:] = [s for s in _pending_steps if s["type"] in ("tool_call", "tool_done")]
+                _pending_steps[:] = [s for s in _pending_steps if s["type"] in ("tool_call", "tool_done", "tool_timeout", "tool_error")]
                 # 如果还有 tool 步骤没发，立即 flush
                 if _pending_steps:
                     _flush_progress()
                 # 推送 streaming 尾部文本（最后一段可能不够 150 字但也是有效输出）
                 # 注意：result 事件包含完整回复，微信最终会再发一次完整消息
                 # 这里只推送 streaming 期间漏掉的尾部，避免用户看到断档
-                # 但如果 streaming 推送总量已经覆盖了回复主体，最终回复可以跳过（在下面处理）
+# 但如果 streaming 推送总量已经覆盖了回复主体，最终回复可以跳过（在下面处理）
+                return
+
+            # ── text_reset：LLM 一轮结束，重置 streaming 位置 ──
+            # 多轮 LLM 交互时，每轮 _current_llm_text 重置为空，下一轮 text_delta 的 text 从 0 开始
+            # 如果 gateway 的 _streaming_text_sent 不重置，第二轮的增量推送位置会错位
+            if step == "text_reset":
+                # 先 flush 当前轮的 streaming 尾部文本
+                full_so_far = _streaming_text_sent[0]  # 已推送字符数
+                if _streaming_last_push[0] > 0 and _streaming_text_sent[0] > 0:
+                    # 如果有未推送的尾部，先推出去
+                    pass  # streaming_text 处理中已经按断句点推送，不会有大量尾部残留
+                # 重置 streaming 位置，下一轮 text_delta 从 0 开始
+                _streaming_text_sent[0] = 0
+                _streaming_last_push[0] = 0
+                logger.debug(f"[{message.platform}-streaming] text_reset, streaming_sent 重置为 0")
                 return
 
             # ── streaming_text：LLM 逐 token 输出，增量推送给客户端 ──
@@ -790,6 +834,10 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                 tool_content = data.get("content", "") or data.get("message", "")
                 short_result = tool_content[:500].strip() if tool_content else ""
                 _pending_steps.append({"type": "tool_done", "tool": tool, "result": short_result})
+            elif step == "tool_timeout":
+                _pending_steps.append({"type": "tool_timeout", "tool": tool, "timeout": data.get("timeout", 20)})
+            elif step == "tool_error":
+                _pending_steps.append({"type": "tool_error", "tool": tool, "error": data.get("error", "")[:200]})
             elif step in ("thinking", "reasoning"):
                 if not content or len(content) < 5:
                     return
@@ -825,7 +873,7 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
 
         # ── 调用 Agent 流式接口 ──
         logger.info(f"[{message.platform}] 开始调用 Agent（流式）...")
-        reply_text = _call_agent_stream(message, current_status, status_lock, cancel_event, on_status=_on_status)
+        reply_text = _call_agent_stream(message, current_status, status_lock, on_status=_on_status)
 
         # ── flush 剩余的进度步骤（最后一批可能还在 pending） ──
         if _flush_timer[0]:
@@ -836,15 +884,10 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         if _pending_steps:
             _flush_progress()
 
-        # ── 停止 typing loop ──
+# ── 停止 typing loop ──
         progress_stop.set()  # 通知 typing loop 停止
         if wechat_typing_thread:
             wechat_typing_thread.join(timeout=3)
-
-        # ── 如果被取消，不发回复（新请求会自己发） ──
-        if cancel_event.is_set():
-            logger.info(f"[{chat_id}] 请求被新请求取消，跳过回复")
-            return
 
         if not reply_text:
             logger.warning(f"[{message.platform}] Agent 返回空回复")
@@ -864,7 +907,7 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
         if _target:
             # streaming 增量推送：避免和已推送内容重复
             streaming_sent = _streaming_text_sent[0]
-            if streaming_sent > 0:
+            if streaming_sent > 0 and streaming_sent < len(reply_text):
                 # 已有 streaming 推送，只发尚未推送的部分
                 remaining = reply_text[streaming_sent:].strip()
                 if remaining:
@@ -882,6 +925,14 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
                         logger.warning(f"[{message.platform}-streaming] 剩余推送失败: {e}")
                 else:
                     logger.info(f"[{message.platform}-streaming] 完整已推送 {streaming_sent}/{len(reply_text)}，跳过最终消息")
+            elif streaming_sent > 0 and streaming_sent >= len(reply_text):
+                # streaming 已推送超过 reply_text 长度（多轮累积），说明 reply_text 只是最后一轮
+                # 直接发完整 reply_text（避免 reply_text[streaming_sent:] 越界变成空字符串）
+                try:
+                    _target.send_reply(reply)
+                    logger.info(f"[{message.platform}-streaming] streaming_sent={streaming_sent} >= reply_text_len={len(reply_text)}，发完整回复")
+                except Exception as e:
+                    logger.error(f"{message.platform}发送回复异常: {e}")
             else:
                 # 无 streaming 推送，发完整消息
                 try:
@@ -893,11 +944,25 @@ def _process_and_reply(message: PlatformMessage, cancel_event: threading.Event):
     except Exception as e:
         logger.error(f"[{message.platform}] 处理消息异常: {e}", exc_info=True)
     finally:
-        # 清理 active_requests
+        # 清理 active_requests（参考Hermes _release_running_agent_state）
         with _active_requests_lock:
             entry = _active_requests.get(chat_id)
             if entry and entry.get("thread") is threading.current_thread():
                 _active_requests.pop(chat_id, None)
+        _busy_ack_ts.pop(chat_id, None)
+
+        # 自动处理排队消息（参考Hermes queue模式：旧任务完成后自动处理pending）
+        next_message = None
+        with _pending_messages_lock:
+            pending = _pending_messages.get(chat_id)
+            if pending:
+                next_message = pending.pop(0)
+                if not pending:
+                    _pending_messages.pop(chat_id, None)
+
+        if next_message:
+            logger.info(f"[{chat_id}] 自动处理排队消息: {next_message.text[:60]}")
+            _start_processing(next_message)
 
 
 # ── HTTP Handler (QQ 上报备选 + 健康检查) ─────────────────────────────────────

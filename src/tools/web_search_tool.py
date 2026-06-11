@@ -1,4 +1,4 @@
-"""网络搜索工具 — 多源并行搜索，汇总去重
+"""网络搜索工具 — 多源并行搜索，汇总去重 (DashengTool 版)
 
 支持搜索源（按优先级）：
 1. AnySearch API（直连，AI 搜索引擎，无需代理）— 优先源
@@ -17,7 +17,9 @@ import ssl
 import urllib.request
 import urllib.parse
 import concurrent.futures
-from langchain_core.tools import tool
+
+from pydantic import BaseModel, Field
+from tools.tool_base import build_tool, DEFAULT_MAX_RESULT_SIZE_CHARS
 
 # 从环境变量读取代理和 API key
 _PROXY = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "http://127.0.0.1:7897"
@@ -48,7 +50,6 @@ def _search_anysearch(query, count=10):
             headers=headers,
             method="POST",
         )
-        # 直连，不走代理
         no_proxy = urllib.request.ProxyHandler({})
         ssl_ctx = ssl._create_unverified_context()
         opener = urllib.request.build_opener(
@@ -74,19 +75,16 @@ def _search_anysearch(query, count=10):
         results = []
         current = {}
         for line in text.split("\n"):
-            # 标题行: ### N. Title
             m = re.match(r"^###\s+\d+\.\s+(.+)$", line.strip())
             if m:
                 if current.get("title"):
                     results.append(current)
                 current = {"title": m.group(1).strip(), "url": "", "snippet": ""}
                 continue
-            # URL 行: - **URL**: https://...
             m = re.match(r"^-?\s*\*{0,2}URL\*{0,2}:\s*(https?://\S+)", line.strip())
             if m:
                 current["url"] = m.group(1).strip()
                 continue
-            # 摘要行: 以 - 开头但不是 URL 的
             m = re.match(r"^-\s+(.+)$", line.strip())
             if m and "URL" not in line:
                 snippet = m.group(1).strip()
@@ -107,7 +105,6 @@ def _search_ddg(query, count=10):
     try:
         from duckduckgo_search import DDGS
         results = []
-        # DDG 直连可用，走代理反而会被限流；先直连，失败再走代理
         for attempt_proxy in [None, _PROXY]:
             try:
                 kwargs = {}
@@ -159,10 +156,8 @@ def _search_bing(query, count=10):
                 continue
 
             title = a.get_text(strip=True)
-            # 用 cite 提取真实 URL（Bing href 是跳转链接，cite 才是真 URL）
             if cite:
                 cite_text = cite.get_text(strip=True)
-                # cite 格式: "https://example.com" 或 "example.com › path"
                 real_url = re.sub(r'\s*›.*', '', cite_text).strip()
                 if not real_url.startswith('http'):
                     real_url = 'https://' + real_url
@@ -178,7 +173,7 @@ def _search_bing(query, count=10):
 
 
 def _search_toutiao(query, count=10):
-    """用头条搜索（直连，中文内容质量最好）— 从 HTML 中提取嵌入的 JSON 搜索结果"""
+    """用头条搜索（直连，中文内容质量最好）"""
     try:
         ssl_ctx = ssl._create_unverified_context()
         no_proxy = urllib.request.ProxyHandler({})
@@ -209,7 +204,6 @@ def _search_toutiao(query, count=10):
             title = title_m.group(1) if title_m else ""
             abstract = abstract_m.group(1) if abstract_m else ""
             source = source_m.group(1) if source_m else ""
-            # 清理 source 中的 HTML 标签和 unicode 转义
             source = re.sub(r"</?em>", "", source)
             source = source.replace("\\u003c", "<").replace("\\u003e", ">")
             title = re.sub(r"</?em>", "", title.replace("\\u003c", "<").replace("\\u003e", ">"))
@@ -240,7 +234,6 @@ def _search_brave(query, count=10):
             "Accept-Encoding": "gzip",
             "X-Subscription-Token": _BRAVE_API_KEY,
         })
-        # Brave API 直连，不走代理
         ssl_ctx = ssl._create_unverified_context()
         no_proxy = urllib.request.ProxyHandler({})
         opener = urllib.request.build_opener(
@@ -267,7 +260,6 @@ def _dedupe_results(all_results):
     deduped = []
     for r in all_results:
         url = r.get("url", "").rstrip("/")
-        # 跳过空 URL 和重复
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
@@ -275,17 +267,15 @@ def _dedupe_results(all_results):
     return deduped
 
 
-@tool
-def web_search(query: str, max_results: int = 10) -> str:
-    """搜索互联网获取信息。当用户问的问题需要最新资讯、事实查证或你不了解的知识时使用。
+# ── DashengTool 注册 ──
 
-    并行调用 AnySearch、Bing、头条、DDG、Brave（如已配置），汇总去重后返回结果。
-    AnySearch 和 Bing 为优先源，质量和覆盖度最好。
+class WebSearchInput(BaseModel):
+    query: str = Field(description="搜索关键词")
+    max_results: int = Field(default=10, description="最多返回的结果数，默认10")
 
-    Args:
-        query: 搜索关键词
-        max_results: 最多返回的结果数，默认10
-    """
+
+def _web_search_impl(query: str, max_results: int = 10) -> str:
+    """核心逻辑 — 多源并行搜索"""
     try:
         sources = {
             "AnySearch": _search_anysearch,
@@ -336,3 +326,19 @@ def web_search(query: str, max_results: int = 10) -> str:
 
     except Exception as e:
         return f"搜索失败: {e}"
+
+
+web_search = build_tool(
+    name="web_search",
+    description=(
+        "搜索互联网获取信息。并行调用 AnySearch、Bing、头条、DDG、Brave，汇总去重后返回。\n"
+        "Args:\n"
+        "  query: 搜索关键词\n"
+        "  max_results: 最多返回结果数(默认10)"
+    ),
+    func=_web_search_impl,
+    args_schema=WebSearchInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=True,
+    is_concurrency_safe=True,   # 网络搜索无副作用，可并行
+)

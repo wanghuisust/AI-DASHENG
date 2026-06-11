@@ -1,33 +1,53 @@
-"""文件读写工具"""
+"""文件读写工具 — DashengTool 版 + Read-Before-Edit 安全机制
+
+迁移自 Claude Code 的 FileStateCache + validate_input 设计：
+- write_file 在覆写已存在文件前，必须先 read_file（防止过时覆写）
+- read_file 结果不过期（max_result_size=inf，防循环读取持久化文件）
+- edit_file 同理需要先读取
+"""
 
 import os
 import re
-from langchain_core.tools import tool
+
+from pydantic import BaseModel, Field
+from tools.tool_base import build_tool, ValidationResult, DEFAULT_MAX_RESULT_SIZE_CHARS
+from tools.file_state_cache import get_file_state_cache
 from tools.tmp_manager import get_tmp_file, get_tmp_dir_path
 
-
 # 需要自动重定向到临时目录的文件扩展名
-TEMP_EXTENSIONS = {'.py', '.sh', '.bat', '.cmd', '.ps1', '.js', '.ts', '.jsx', '.tsx', '.vue', '.html', '.css', '.json', '.yaml', '.yml', '.xml', '.sql', '.log', '.txt'}
+TEMP_EXTENSIONS = {'.py', '.sh', '.bat', '.cmd', '.ps1', '.js', '.ts', '.jsx', '.tsx',
+                   '.vue', '.html', '.css', '.json', '.yaml', '.yml', '.xml', '.sql', '.log', '.txt'}
 
 
-@tool
-def read_file(path: str, encoding: str = "utf-8") -> str:
-    """读取文件内容。支持文本文件，自动截断超长文件。
+# ── 参数 Schema ──
 
-    Args:
-        path: 文件路径
-        encoding: 文件编码，默认 utf-8
+class ReadFileInput(BaseModel):
+    path: str = Field(description="文件路径")
+    encoding: str = Field(default="utf-8", description="文件编码，默认 utf-8")
 
-    Returns:
-        文件内容字符串
-    """
+
+class WriteFileInput(BaseModel):
+    path: str = Field(description="文件路径")
+    content: str = Field(description="要写入的内容")
+
+
+class CleanupTmpInput(BaseModel):
+    """无参数工具，但 Pydantic 需要一个空 Schema"""
+    pass
+
+
+# ── read_file ──
+
+def _read_file_impl(path: str, encoding: str = "utf-8") -> str:
+    """核心逻辑 — 不做手动截断，交给框架"""
     try:
         with open(path, "r", encoding=encoding, errors="replace") as f:
             content = f.read()
-        # 截断超长文件
-        max_chars = 50000
-        if len(content) > max_chars:
-            content = content[:max_chars] + f"\n\n... (文件过长，已截断，共 {len(content)} 字符)"
+
+        # 记录到 FileStateCache（Read-Before-Edit 核心）
+        cache = get_file_state_cache()
+        cache.record_read(path, content)
+
         return content
     except FileNotFoundError:
         return f"[错误] 文件不存在: {path}"
@@ -35,46 +55,61 @@ def read_file(path: str, encoding: str = "utf-8") -> str:
         return f"[错误] 读取失败: {e}"
 
 
-@tool
-def write_file(path: str, content: str) -> str:
-    """写入文件。如果文件不存在则创建，存在则覆盖。
+read_file = build_tool(
+    name="read_file",
+    description=(
+        "读取文件内容。支持文本文件。\n"
+        "Args:\n"
+        "  path: 文件路径\n"
+        "  encoding: 文件编码，默认 utf-8"
+    ),
+    func=_read_file_impl,
+    args_schema=ReadFileInput,
+    max_result_size=float("inf"),   # ← 关键：永不持久化，防循环读取
+    is_read_only=True,
+    is_concurrency_safe=True,
+)
 
-    注意：写入临时脚本文件（.py/.sh/.bat 等）时，会自动重定向到临时缓冲目录，
-    任务完成后自动清理。
 
-    Args:
-        path: 文件路径
-        content: 要写入的内容
+# ── write_file ──
 
-    Returns:
-        操作结果
-    """
-    try:
-        # 判断是否为临时脚本文件
-        ext = os.path.splitext(path)[1].lower()
-        if ext in TEMP_EXTENSIONS:
-            # 检查是否是绝对路径或包含目录路径
-            if os.path.isabs(path) or '/' in path or '\\' in path:
-                # 如果用户明确指定了目录（如 data/xxx.py），则使用指定路径
-                # 如果只是文件名（如 script.py），则重定向到临时目录
-                dirname = os.path.dirname(path)
-                if not dirname:
-                    # 纯文件名，重定向到临时目录
-                    real_path = get_tmp_file(ext)
-                    return _write_content(real_path, content)
-            
-            # 有目录路径，使用用户指定的路径
-            return _write_content(path, content)
-        else:
-            # 非临时文件类型，直接写入
-            return _write_content(path, content)
-    except Exception as e:
-        return f"[错误] 写入失败: {e}"
+def _write_file_validate(**kwargs) -> ValidationResult:
+    """Read-Before-Edit 验证 — 已存在文件必须先读取"""
+    path = kwargs.get("path", "")
+    if not path:
+        return ValidationResult.deny("路径不能为空")
+
+    # 规范化路径
+    path = os.path.normpath(os.path.abspath(path))
+
+    # 判断是否会重定向到临时文件
+    ext = os.path.splitext(path)[1].lower()
+    will_redirect = False
+    if ext in TEMP_EXTENSIONS:
+        if not os.path.isabs(path) and '/' not in path and '\\' not in path:
+            dirname = os.path.dirname(path)
+            if not dirname:
+                will_redirect = True
+
+    # 重定向到临时文件的不需要 Read-Before-Edit 检查
+    if will_redirect:
+        return ValidationResult.ok()
+
+    # 新文件不需要检查
+    if not os.path.exists(path):
+        return ValidationResult.ok()
+
+    # 已存在文件 → 检查 Read-Before-Edit
+    cache = get_file_state_cache()
+    allowed, reason = cache.check_write_allowed(path)
+    if not allowed:
+        return ValidationResult.deny(reason)
+
+    return ValidationResult.ok()
 
 
 def _write_content(path: str, content: str) -> str:
     """实际写入文件内容"""
-    import os
     dirname = os.path.dirname(path)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -83,19 +118,60 @@ def _write_content(path: str, content: str) -> str:
     return f"成功写入 {len(content)} 字符到 {path}"
 
 
-@tool
-def cleanup_tmp_files() -> str:
-    """清理临时缓冲目录中的所有文件。
+def _write_file_impl(path: str, content: str) -> str:
+    """核心逻辑 — 临时文件重定向逻辑保留"""
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in TEMP_EXTENSIONS:
+            if os.path.isabs(path) or '/' in path or '\\' in path:
+                dirname = os.path.dirname(path)
+                if not dirname:
+                    real_path = get_tmp_file(ext)
+                    return _write_content(real_path, content)
+            return _write_content(path, content)
+        else:
+            return _write_content(path, content)
+    except Exception as e:
+        return f"[错误] 写入失败: {e}"
 
-    当 AI Agent 完成所有临时脚本任务后，可以调用此工具清理临时文件。
-    
-    Returns:
-        清理结果
-    """
+
+write_file = build_tool(
+    name="write_file",
+    description=(
+        "写入文件。如果文件不存在则创建，存在则覆盖。\n"
+        "注意：写入临时脚本文件（.py/.sh/.bat 等）时，会自动重定向到临时缓冲目录。\n"
+        "注意：覆写已存在文件前，必须先调用 read_file 读取该文件。\n"
+        "Args:\n"
+        "  path: 文件路径\n"
+        "  content: 要写入的内容"
+    ),
+    func=_write_file_impl,
+    args_schema=WriteFileInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=False,
+    is_concurrency_safe=False,
+    validate_input=_write_file_validate,
+)
+
+
+# ── cleanup_tmp_files ──
+
+def _cleanup_tmp_impl() -> str:
     try:
         from tools.tmp_manager import cleanup_tmp_dir
-        cleanup_tmp_dir(max_age_hours=0)  # 立即清理所有文件
+        cleanup_tmp_dir(max_age_hours=0)
         tmp_dir = get_tmp_dir_path()
         return f"已清理临时目录: {tmp_dir}"
     except Exception as e:
         return f"[错误] 清理失败: {e}"
+
+
+cleanup_tmp_files = build_tool(
+    name="cleanup_tmp_files",
+    description="清理临时缓冲目录中的所有文件。当完成所有临时脚本任务后调用。",
+    func=_cleanup_tmp_impl,
+    args_schema=CleanupTmpInput,
+    max_result_size=DEFAULT_MAX_RESULT_SIZE_CHARS,
+    is_read_only=False,
+    is_concurrency_safe=True,
+)
