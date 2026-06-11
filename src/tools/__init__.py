@@ -10,6 +10,7 @@ from .search_tool import search_files
 from .web_search_tool import web_search
 from .memory_tool import memory_save, memory_search, memory_forget
 from .skill_tool import skill_install, skill_list, skill_search, skill_remove, skill_view
+from .disk_tool import disk_analyze
 
 # FileStateCache 重置函数（graph.py 在新 session 开始时调用）
 from .file_state_cache import reset_file_state_cache
@@ -19,7 +20,7 @@ ALL_TOOLS = [
     terminal_execute, read_file, write_file, search_files,
     web_search, memory_save, memory_search, memory_forget,
     skill_install, skill_list, skill_search, skill_remove, skill_view,
-    cleanup_tmp_files
+    cleanup_tmp_files, disk_analyze
 ]
 
 __all__ = ["ALL_TOOLS", "reset_file_state_cache"]

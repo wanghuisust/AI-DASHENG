@@ -78,9 +78,74 @@ def _summarize_tool_output(name: str, content: str) -> str:
     return content[:TOOL_OUTPUT_MAX_CHARS] + "\n... (已截断)"
 
 
+def _smart_truncate(content: str, name: str) -> str:
+    """智能截断：保留首尾，标注省略量（参考Claude Code FileReadTool多层截断）
+
+    核心原则：关键信息不丢失，LLM能用offset/limit续读
+    """
+    if not content or len(content) <= TOOL_OUTPUT_MAX_CHARS:
+        return content
+
+    HEAD = 2000
+    TAIL = 2000
+    name_lower = (name or "").lower()
+
+    # 搜索类工具：保留更多头部（文件列表最重要）
+    if any(kw in name_lower for kw in ["search", "find", "glob", "ls"]):
+        HEAD = 3000
+        TAIL = 1000
+
+    # 读取类工具：保留行号信息，提示offset续读
+    if any(kw in name_lower for kw in ["read", "cat", "head"]):
+        lines = content.strip().split("\n")
+        if len(lines) <= 100:
+            return content  # 行数不多就不截断
+        head_lines = lines[:30]
+        tail_lines = lines[-10:]
+        omitted_lines = len(lines) - 40
+        return (
+            "\n".join(head_lines)
+            + f"\n\n... [已省略 {omitted_lines} 行，可用 offset/limit 参数读取指定部分] ...\n\n"
+            + "\n".join(tail_lines)
+        )
+
+    # 终端类工具：首尾保留
+    if any(kw in name_lower for kw in ["terminal", "shell", "exec", "bash"]):
+        lines = content.strip().split("\n")
+        if len(lines) <= 50:
+            # 行数不多但字符超限，直接截断
+            if len(content) <= TOOL_OUTPUT_MAX_CHARS:
+                return content
+            return content[:TOOL_OUTPUT_MAX_CHARS] + "\n... [输出已截断]"
+
+        head_lines = lines[:10]
+        tail_lines = lines[-8:]
+        omitted_lines = len(lines) - 18
+        return (
+            "\n".join(head_lines)
+            + f"\n\n... [已省略 {omitted_lines} 行] ...\n\n"
+            + "\n".join(tail_lines)
+        )
+
+    # 通用截断：保留首尾字符
+    head = content[:HEAD]
+    tail = content[-TAIL:]
+    omitted = len(content) - HEAD - TAIL
+    return (
+        head
+        + f"\n\n... [已省略 {omitted:,} 字符] ...\n\n"
+        + tail
+    )
+
+
 def _prune_tool_outputs(messages: list) -> list:
-    """预处理工具输出：去重 + 截断冗长返回"""
-    seen_tool_hashes = {}
+    """预处理工具输出：智能截断冗长返回（不再用去重标记）
+
+    改造说明（参考Claude Code设计）：
+    - 去重标记"(同第X条消息)"让LLM看不到完整结果，导致重复调用
+    - 改为智能截断：首尾保留+省略提示，LLM能看到关键信息
+    - 去重由guardrail在调用前判断（已实现），不需要在结果层做
+    """
     result = []
 
     for i, msg in enumerate(messages):
@@ -90,29 +155,18 @@ def _prune_tool_outputs(messages: list) -> list:
 
         tool_name = getattr(msg, "name", "tool")
         content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
-        output_hash = _content_hash(content)
 
-        key = (tool_name, output_hash)
-        if key in seen_tool_hashes:
-            first_idx = seen_tool_hashes[key]
+        # 智能截断（替代去重标记）
+        trimmed = _smart_truncate(content, tool_name)
+        if trimmed != content:
             new_msg = ToolMessage(
-                content=f"(同第 {first_idx + 1} 条消息的 {tool_name} 输出，已去重)",
+                content=trimmed,
                 tool_call_id=getattr(msg, "tool_call_id", ""),
                 name=tool_name,
             )
             result.append(new_msg)
         else:
-            seen_tool_hashes[key] = i
-            trimmed = _summarize_tool_output(tool_name, content)
-            if trimmed != content:
-                new_msg = ToolMessage(
-                    content=trimmed,
-                    tool_call_id=getattr(msg, "tool_call_id", ""),
-                    name=tool_name,
-                )
-                result.append(new_msg)
-            else:
-                result.append(msg)
+            result.append(msg)
 
     return result
 
@@ -251,26 +305,59 @@ def _extract_turn_content_for_summary(
 # Phase 5: LLM结构化摘要 + 重试容错 (融合两者)
 # ═══════════════════════════════════════════════════════════
 
-SUMMARY_TEMPLATE = """Summarize the following agent conversation turns concisely. This summary will replace these turns in the conversation history.
+SUMMARY_TEMPLATE = """你是一个上下文压缩助手。你的任务是将对话历史压缩为结构化摘要。
 
-Write the summary from a neutral perspective describing what the assistant did and learned. Include:
-1. What actions the assistant took (tool calls, searches, file operations)
-2. Key information or results obtained
-3. Any important decisions or findings
-4. Relevant data, file names, values, or outputs
+重要规则：
+- 你不能调用任何工具
+- 你必须保留所有关键信息
+- 你必须按以下模板输出
 
-Keep the summary factual and informative. Target approximately {summary_target_tokens} tokens.
+<analysis>
+[分析当前对话状态：用户在做什么、进展如何、遇到了什么问题]
+</analysis>
 
+<summary>
+Primary Request:
+[用户的原始请求，原文保留]
+
+Key Technical Concepts:
+[涉及的关键技术概念、框架、库]
+
+Files and Code Sections:
+[列出所有涉及到的文件路径和关键代码段]
+格式: - path/to/file: [简要说明文件角色和关键内容]
+
+Errors Encountered:
+[遇到的错误及其原因分析]
+
+Problem Solving:
+[已解决的问题和解决方法]
+
+Pending Tasks:
+[尚未完成的任务列表]
+
+Current State:
+[当前处于什么状态，正在做什么]
+
+Next Steps:
+[建议的下一步操作]
+</summary>
 ---
+
 TURNS TO SUMMARIZE:
 {content}
 ---
 
-Write only the summary, starting with "{summary_prefix}:" prefix."""
+Write only the summary, starting with "{summary_prefix}:" prefix.
+Target approximately {summary_target_tokens} tokens."""
 
-INCREMENTAL_TEMPLATE = """你是一个对话摘要助手。下面有一段旧摘要和一段新的对话记录。
-请将新信息合并到旧摘要中，更新各部分内容。如果旧摘要中的信息不再相关，可以删除。
-保持每个部分简洁（1-3 行），总长度不超过 {max_chars} 字符。
+INCREMENTAL_TEMPLATE = """你是一个上下文压缩助手。下面有一段旧摘要和一段新的对话记录。
+请将新信息合并到旧摘要中，严格按照以下结构化模板更新。
+
+重要规则：
+- 必须保留所有文件路径、错误信息、关键数值
+- 每个字段1-3行，总长度不超过 {max_chars} 字符
+- 按模板结构输出，不要自由格式
 
 旧摘要：
 {old_summary}
@@ -278,7 +365,7 @@ INCREMENTAL_TEMPLATE = """你是一个对话摘要助手。下面有一段旧摘
 新对话记录：
 {new_history}
 
-请输出更新后的完整摘要（保持原有的 ## 标题结构）：
+请输出更新后的完整摘要（保持 <summary> 结构）：
 """
 
 FALLBACK_SUMMARY = "[CONTEXT SUMMARY]: [摘要生成失败 — 之前的工具调用和响应已被压缩以节省上下文空间。]"
